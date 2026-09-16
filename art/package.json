@@ -1,0 +1,18 @@
+{
+  "name": "art",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-contained generative pieces. One HTML file each, no media, no external references. The tools prove it.",
+  "scripts": {
+    "verify": "node verify.mjs",
+    "scan": "node verify.mjs --scan-only",
+    "sheet": "node tools/sheet.mjs",
+    "smoke": "node tools/smoke.mjs",
+    "audio": "node tools/audio.mjs",
+    "ablate": "node tools/ablate.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}

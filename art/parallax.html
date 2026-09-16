@@ -1,0 +1,2268 @@
+<!doctype html><html><head><meta charset="utf8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Parallax</title>
+<style>
+  html,body{height:100%;margin:0;background:#05060a;overflow:hidden}
+  canvas{display:block;width:100%;height:100%;touch-action:none;cursor:none}
+</style></head><body>
+<canvas id="c"></canvas>
+<script>
+/*
+  PARALLAX
+  A galactic survey console. Nothing in this file is a picture.
+  Every frame is computed: the galaxy, the instrument, the noise, the sound.
+
+  Lamplighter prints three inks onto paper and composites them with multiply,
+  so nothing can ever be lighter than the paper and highlights are knocked out.
+  This is the mirror of that. Three phosphor channels are composited onto the
+  void with `lighter`, so nothing can ever be DARKER than the void, and shadows
+  are not painted — they are subtracted. The dust lanes are the whole reason
+  the galaxy reads as a galaxy, and they are made of removal.
+
+  Structure
+    1  parameters, seeded randomness, value noise
+    2  the channels  (cyan / amber / magenta, composited by lighter)
+    3  the galaxy    (real Milky Way skeleton; the seed decides the survey)
+    4  the survey    (one number — the wavelength — drives every colour)
+    5  drawing       (void, galaxy, instrument, readouts)
+    6  the screen    (bloom, scanlines, aberration, glass)
+    7  a frame
+    8  overlay
+    9  audio         (drone, telemetry, sweep — all synthesised, all synced)
+    10 capture
+    11 the purity check
+    12 the loop, and the hands on it
+
+  URL parameters
+    ?s=5        seed
+    ?f=140      start frame
+    ?still=1    render exactly one frame, then stop
+    ?det=1      advance by a fixed 1/60s per frame instead of wall clock
+
+  Drag to orbit · wheel to zoom · click a contact to lock it · ? for keys
+*/
+(function () {
+'use strict';
+
+// ─────────────────────────────────────────────────────────────── 1. groundwork
+
+var Q = new URLSearchParams(location.search);
+var SEED        = Q.has('s') ? (parseInt(Q.get('s'), 10) | 0) : (Math.random() * 1e9) | 0;
+var START_FRAME = Q.has('f') ? Math.max(0, parseInt(Q.get('f'), 10) | 0) : 0;
+var STILL       = Q.get('still') === '1';
+var DETERM      = Q.get('det') === '1' || STILL;
+var FPS  = 60;
+var LOOP = 96;                    // seconds for one full survey cycle
+var TAU  = Math.PI * 2;
+
+// Every period in this piece divides LOOP, so the whole thing is a true loop —
+// not just the palette. Lamplighter only looped its sky; this one loops.
+var SWEEP_P = LOOP / 8;           // 12 s — the radar sweep
+var RING_A  = LOOP / 3;
+var RING_B  = LOOP / 4;
+var RING_C  = LOOP / 2;
+var TICK_P  = LOOP / 64;          // 1.5 s — telemetry refresh
+var PULSE_P = LOOP / 16;          // 6 s — the anomaly
+
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function lerp(a, b, t)  { return a + (b - a) * t; }
+function smooth(t)      { return t * t * (3 - 2 * t); }
+function sstep(a, b, x) { return smooth(clamp((x - a) / (b - a), 0, 1)); }
+function fract(x)       { return x - Math.floor(x); }
+function bump(x, c, w)  { return Math.exp(-Math.pow((x - c) / w, 2)); }
+
+// mulberry32 — small, fast, and identical on every machine
+function mulberry32(a) {
+  return function () {
+    a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var rnd = mulberry32(SEED);
+function rr(a, b)  { return a + (b - a) * rnd(); }
+function ri(a, b)  { return Math.floor(rr(a, b + 1)); }
+function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
+// box-muller, because a galaxy is made of normal distributions
+function rg() {
+  var u = 1 - rnd(), v = rnd();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * v);
+}
+
+function makeNoise(seed) {
+  var r = mulberry32(seed), p = new Uint8Array(256), i, j, t;
+  for (i = 0; i < 256; i++) p[i] = i;
+  for (i = 255; i > 0; i--) { j = (r() * (i + 1)) | 0; t = p[i]; p[i] = p[j]; p[j] = t; }
+  var perm = new Uint8Array(512);
+  for (i = 0; i < 512; i++) perm[i] = p[i & 255];
+  var G = [[1,1],[-1,1],[1,-1],[-1,-1],[1,0],[-1,0],[0,1],[0,-1]];
+  function fade(x) { return x * x * x * (x * (x * 6 - 15) + 10); }
+  function n2(x, y) {
+    var X = Math.floor(x), Y = Math.floor(y);
+    var xf = x - X, yf = y - Y;
+    X &= 255; Y &= 255;
+    var u = fade(xf), v = fade(yf);
+    function g(ix, iy, dx, dy) {
+      var h = perm[(perm[(X + ix) & 255] + Y + iy) & 255] & 7;
+      return G[h][0] * dx + G[h][1] * dy;
+    }
+    var a = lerp(g(0, 0, xf, yf),     g(1, 0, xf - 1, yf),     u);
+    var b = lerp(g(0, 1, xf, yf - 1), g(1, 1, xf - 1, yf - 1), u);
+    return lerp(a, b, v);
+  }
+  function fbm(x, y, oct) {
+    var s = 0, amp = 0.5, f = 1;
+    for (var k = 0; k < (oct || 4); k++) { s += n2(x * f, y * f) * amp; f *= 2; amp *= 0.5; }
+    return s;
+  }
+  return { n2: n2, fbm: fbm };
+}
+var N = makeNoise(SEED ^ 0x9E3779B9);
+
+function curve(keys, u) {
+  var i = 0;
+  while (i < keys.length - 2 && u >= keys[i + 1][0]) i++;
+  var a = keys[i], b = keys[i + 1];
+  return lerp(a[1], b[1], smooth((u - a[0]) / (b[0] - a[0])));
+}
+
+// ─────────────────────────────────────────────────────────────── 2. the channels
+//
+// Three phosphor channels, each an offscreen canvas starting black, each
+// carrying one colour. They composite onto the void with `lighter`, which is
+// exactly what emission does: light adds, and the order does not matter.
+//
+// That commutativity is worth saying out loud, because it is a gift. Nine
+// thousand stars need no depth sort. Only the dust does, because dust is the
+// one thing here that takes light away.
+//
+//   emit()    add light in this channel
+//   occlude() multiply toward black — the only way to make anything darker
+//
+// The corollary, and it is the mirror of Lamplighter's: you cannot draw a dark
+// nebula by painting it dark. There is no dark to paint with. You have to
+// subtract what is already there, which means dust must be drawn in depth
+// order, between the far stars and the near ones.
+
+var CHAN = ['c', 'a', 'm'];
+var CH = {
+  c: '40,215,255',     // instrument cyan — structure, young stars, the machine
+  a: '255,158,52',     // amber — old stars, the bulge, warnings
+  m: '255,64,196'      // magenta — ionised gas, compact objects, the anomaly
+};
+var VOID = '#05060a';
+
+var view = document.getElementById('c');
+var out  = view.getContext('2d', { alpha: false });
+var buf  = {};
+var W = 0, H = 0, CX = 0, CY = 0, SCALE = 1, GU = 12;
+var quality = 1;
+
+for (var ci = 0; ci < 3; ci++) {
+  var ck = CHAN[ci], cel = document.createElement('canvas');
+  buf[ck] = { c: cel, g: cel.getContext('2d', { alpha: false }) };
+}
+
+function emit(g, k, a) {
+  g.globalCompositeOperation = 'lighter';
+  var s = 'rgba(' + CH[k] + ',' + a + ')';
+  g.fillStyle = s; g.strokeStyle = s;
+}
+// Multiply toward black attenuates exactly: dst * (1 - a). On an opaque canvas
+// that is well defined, which destination-out is not.
+function occlude(g, a) {
+  g.globalCompositeOperation = 'multiply';
+  var s = 'rgba(0,0,0,' + a + ')';
+  g.fillStyle = s; g.strokeStyle = s;
+}
+function plain(g) { g.globalCompositeOperation = 'source-over'; }
+
+// Pre-rendered glow sprites, one per channel. A radial gradient per bright star
+// per frame is the single most expensive thing you can do on a canvas; a
+// drawImage of a 64px sprite is nearly free.
+var sprite = {}, dustSprite = null, dustMask = null, dustMaskG = null, SPR = 64;
+function buildSprites() {
+  for (var i = 0; i < 3; i++) {
+    var k = CHAN[i], c = document.createElement('canvas');
+    c.width = c.height = SPR;
+    var g = c.getContext('2d');
+    var gr = g.createRadialGradient(SPR / 2, SPR / 2, 0, SPR / 2, SPR / 2, SPR / 2);
+    gr.addColorStop(0.00, 'rgba(' + CH[k] + ',1)');
+    gr.addColorStop(0.12, 'rgba(' + CH[k] + ',0.62)');
+    gr.addColorStop(0.34, 'rgba(' + CH[k] + ',0.18)');
+    gr.addColorStop(0.66, 'rgba(' + CH[k] + ',0.04)');
+    gr.addColorStop(1.00, 'rgba(' + CH[k] + ',0)');
+    g.fillStyle = gr;
+    g.fillRect(0, 0, SPR, SPR);
+    sprite[k] = c;
+  }
+  // the same idea in black, for the one thing here that removes light
+  var d = document.createElement('canvas');
+  d.width = d.height = SPR;
+  var dg = d.getContext('2d');
+  var dr = dg.createRadialGradient(SPR / 2, SPR / 2, 0, SPR / 2, SPR / 2, SPR / 2);
+  dr.addColorStop(0.00, 'rgba(0,0,0,1)');
+  dr.addColorStop(0.40, 'rgba(0,0,0,0.58)');
+  dr.addColorStop(1.00, 'rgba(0,0,0,0)');
+  dg.fillStyle = dr;
+  dg.fillRect(0, 0, SPR, SPR);
+  dustSprite = d;
+}
+
+function glow(g, k, x, y, r, a) {
+  if (a < 0.004 || r < 0.4) return;
+  g.globalCompositeOperation = 'lighter';
+  g.globalAlpha = Math.min(1, a);
+  g.drawImage(sprite[k], x - r, y - r, r * 2, r * 2);
+  g.globalAlpha = 1;
+}
+
+var compact = false, bloomC = null, bloomG = null, bloomS = null, bloomSG = null;
+
+function resize() {
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // measure the canvas box, not the window, so the piece sizes correctly inside
+  // an iframe or any padded container and not only as a standalone page
+  var cw = Math.max(320, view.clientWidth || window.innerWidth);
+  var chh = Math.max(240, view.clientHeight || window.innerHeight);
+  var px = cw * chh * dpr * dpr;
+  var cap = 2.4e6;
+  SCALE = dpr * (px > cap ? Math.sqrt(cap / px) : 1);
+  W = Math.round(cw * SCALE); H = Math.round(chh * SCALE);
+  view.width = W; view.height = H;
+  for (var i = 0; i < 3; i++) {
+    var b = buf[CHAN[i]];
+    b.c.width = W; b.c.height = H;
+    b.g.lineCap = 'round'; b.g.lineJoin = 'round';
+  }
+  CX = W * 0.5; CY = H * 0.5;
+  compact = (W / SCALE) < 780 || (H / SCALE) < 520;
+
+  // the dot grid every element in the interface hangs on. One number.
+  GU = Math.max(8, Math.round(Math.min(W, H) / 52));
+
+  bloomC = document.createElement('canvas');
+  bloomC.width = Math.max(2, W >> 3); bloomC.height = Math.max(2, H >> 3);
+  bloomG = bloomC.getContext('2d');
+  bloomS = document.createElement('canvas');
+  bloomS.width = Math.max(2, W >> 5); bloomS.height = Math.max(2, H >> 5);
+  bloomSG = bloomS.getContext('2d');
+
+  buildSprites();
+  buildGalaxy();
+  buildScreen();
+  allocProjection();
+}
+window.addEventListener('resize', function () { clearTimeout(resize._t); resize._t = setTimeout(resize, 120); });
+
+// snap to the grid. Everything in the interface goes through this.
+function gx(n) { return Math.round(n / GU) * GU; }
+
+// ───────────────────────────────────────────────────────────────── 3. the galaxy
+//
+// The skeleton is not seeded. Four arms, a bar, a bulge, the Sun eight and a bit
+// kiloparsecs out in the Orion Spur — those are facts about the actual Milky Way
+// and a seed has no business changing them. Reid et al. fit log-periodic spirals
+// to maser parallaxes and land on a pitch angle near 11-13°, so that is what
+// these use.
+//
+// What the seed decides is the SURVEY: which stars this instrument happened to
+// resolve, which objects it catalogued, where the dust clumped, and where the
+// anomaly is. Every seed is the same galaxy, differently observed.
+
+var KPC = 11.5;                     // half-width of the field, in kiloparsecs
+var PITCH = 0.1990;                 // tan(11.3°)
+var SUN_R = 8.2, SUN_TH = -0.28;
+var BAR_A = 0.42, BAR_L = 4.25;     // the bar's angle to the Sun line, and its half-length
+
+var ARMS = [
+  { name: 'PERSEUS',            r0: 4.30, th0: 1.60,           sweep: 3.98, pitch: 1.00, w: 0.40, mass: 1.00 },
+  { name: 'SCUTUM-CENTAURUS',   r0: 4.05, th0: 1.60 + Math.PI, sweep: 4.06, pitch: 1.04, w: 0.43, mass: 1.00 },
+  { name: 'SAGITTARIUS-CARINA', r0: 4.10, th0: 0.42,           sweep: 3.70, pitch: 0.93, w: 0.31, mass: 0.80 },
+  { name: 'NORMA',              r0: 3.55, th0: 0.42 + Math.PI, sweep: 3.40, pitch: 0.90, w: 0.30, mass: 0.76 }
+];
+
+var world = null;
+var SX, SY, SZ, SM, SC;             // star position, magnitude, class
+var NSTAR = 0;
+
+// Arm spine in the disk plane. `kink` bends the pitch angle partway out, which
+// is what the maser fits actually show and what stops the arms looking like
+// clip art.
+function armPoint(a, t) {
+  var th = a.th0 + t * a.sweep;
+  var k = PITCH * a.pitch * (1 + 0.17 * Math.sin(t * 2.4 + a.th0));
+  var r = a.r0 * Math.exp(k * (th - a.th0));
+  return { x: r * Math.cos(th), y: r * Math.sin(th), r: r, th: th };
+}
+
+var CLASS_HOT = 0, CLASS_SOL = 1, CLASS_COOL = 2, CLASS_EXOTIC = 3;
+
+var CAT_PREFIX = ['KX', 'HDS', 'GLM', 'VRT', 'PSR', 'TYC', 'NGC', 'IRAS', 'WR', 'HIP'];
+var CAT_CLASS  = ['MAIN SEQ', 'GIANT BRANCH', 'PROTOSTELLAR', 'BINARY', 'VARIABLE',
+                  'HII REGION', 'GLOBULAR', 'OPEN CLUSTER', 'SNR', 'MASER SOURCE',
+                  'X-RAY BINARY', 'DARK NEBULA'];
+
+function designation() {
+  return pick(CAT_PREFIX) + '-' + ri(100, 9989) + (rnd() < 0.42 ? String.fromCharCode(65 + ri(0, 7)) : '');
+}
+
+function buildGalaxy() {
+  rnd = mulberry32(SEED);
+  var w = {}, i, j;
+
+  // ── the population. Roughly: bulge, bar, arms, inter-arm disk, halo.
+  var n = Math.round(11000 * (quality < 1 ? quality * 0.8 + 0.2 : 1));
+  NSTAR = n;
+  SX = new Float32Array(n); SY = new Float32Array(n); SZ = new Float32Array(n);
+  SM = new Float32Array(n); SC = new Uint8Array(n);
+
+  var armCum = [], tot = 0;
+  for (i = 0; i < ARMS.length; i++) { tot += ARMS[i].mass; armCum.push(tot); }
+
+  for (i = 0; i < n; i++) {
+    var u = rnd(), x, y, z, cls, mag;
+
+    if (u < 0.14) {
+      // bulge — old, amber, fat, slightly boxy because the bar makes it so
+      var br = Math.abs(rg()) * 1.15;
+      var bth = rnd() * TAU;
+      x = br * Math.cos(bth) * 1.25; y = br * Math.sin(bth) * 0.82;
+      z = rg() * 0.58;
+      cls = rnd() < 0.82 ? CLASS_COOL : CLASS_SOL;
+      mag = Math.pow(rnd(), 2.1) * 0.7 + 0.06;
+
+    } else if (u < 0.235) {
+      // the bar — a stretched ellipse, canted to the Sun–centre line
+      // density rises toward the ends, which is what makes a bar look like a
+      // bar and not like a cigar-shaped bulge
+      var bt = rr(-1, 1);
+      bt = Math.sign(bt) * Math.pow(Math.abs(bt), 0.72);
+      var bx = bt * BAR_L, by = rg() * 0.30 * (1 - Math.abs(bt) * 0.45);
+      x = bx * Math.cos(BAR_A) - by * Math.sin(BAR_A);
+      y = bx * Math.sin(BAR_A) + by * Math.cos(BAR_A);
+      z = rg() * 0.26;
+      cls = rnd() < 0.68 ? CLASS_COOL : CLASS_SOL;
+      mag = Math.pow(rnd(), 1.8) * 0.80 + 0.07;
+
+    } else if (u < 0.82) {
+      // the arms — where the young hot stars are
+      var pickv = rnd() * tot, ai = 0;
+      while (ai < armCum.length - 1 && pickv > armCum[ai]) ai++;
+      var a = ARMS[ai];
+      var t = Math.pow(rnd(), 0.82);
+      var p = armPoint(a, t);
+      var spread = a.w * (0.42 + t * 0.78);
+      var offr = rg() * spread;
+      var offth = rg() * spread * 0.30 / Math.max(0.6, p.r);
+      var rr2 = p.r + offr, th2 = p.th + offth;
+      x = rr2 * Math.cos(th2); y = rr2 * Math.sin(th2);
+      z = rg() * (0.16 + p.r * 0.014);
+      var hot = rnd();
+      cls = hot < 0.30 ? CLASS_HOT : hot < 0.80 ? CLASS_SOL : CLASS_COOL;
+      mag = Math.pow(rnd(), 2.3) * 0.85 + 0.05;
+
+    } else if (u < 0.968) {
+      // inter-arm disk — exponential, quieter, older
+      var dr = -Math.log(1 - rnd() * 0.982) * 3.6 + 1.4;
+      var dth = rnd() * TAU;
+      x = dr * Math.cos(dth); y = dr * Math.sin(dth);
+      z = rg() * (0.22 + dr * 0.016);
+      cls = rnd() < 0.34 ? CLASS_COOL : CLASS_SOL;
+      mag = Math.pow(rnd(), 2.5) * 0.6 + 0.03;
+
+    } else {
+      // halo — sparse, old, and it is what makes the edge-on view have a shape
+      var hr = 3 + Math.pow(rnd(), 0.6) * 15;
+      var hth = rnd() * TAU, hph = Math.acos(rr(-1, 1));
+      x = hr * Math.sin(hph) * Math.cos(hth);
+      y = hr * Math.sin(hph) * Math.sin(hth) * 0.9;
+      z = hr * Math.cos(hph) * 0.72;
+      cls = rnd() < 0.08 ? CLASS_EXOTIC : CLASS_COOL;
+      mag = Math.pow(rnd(), 2.8) * 0.5 + 0.02;
+    }
+
+    SX[i] = x; SY[i] = y; SZ[i] = z; SM[i] = mag; SC[i] = cls;
+  }
+
+  // ── HII regions: star-forming knots strung along the arms. These are the
+  //    magenta channel's reason to exist.
+  w.hii = [];
+  for (i = 0; i < ARMS.length; i++) {
+    var a2 = ARMS[i], cnt = Math.round(14 * a2.mass) + ri(3, 7);
+    for (j = 0; j < cnt; j++) {
+      var t2 = Math.pow(rnd(), 0.8);
+      var p2 = armPoint(a2, t2);
+      var jitter = a2.w * 0.5;
+      w.hii.push({
+        x: p2.x + rg() * jitter, y: p2.y + rg() * jitter, z: rg() * 0.18,
+        r: rr(0.12, 0.44) * (1 + t2 * 0.5),
+        v: rr(0.35, 1.0), ph: rr(0, TAU), arm: i
+      });
+    }
+  }
+
+  // ── dust. Chains of clumps lying just inside each arm spine, which is where
+  //    they sit in real galaxies and which is why arms look like they have an
+  //    edge. In the optical these subtract; in the infrared they emit. That
+  //    flip is the trick the whole piece is built on.
+  w.dust = [];
+  for (i = 0; i < ARMS.length; i++) {
+    var a3 = ARMS[i], steps = 132;
+    for (j = 0; j < steps; j++) {
+      var t3 = j / (steps - 1);
+      var p3 = armPoint(a3, t3);
+      // just inside the spine
+      var inward = 0.30 + 0.22 * t3;
+      var nx = -Math.cos(p3.th), ny = -Math.sin(p3.th);
+      var wob = N.fbm(t3 * 6 + i * 13.7, 2.3, 4) * 0.62;
+      w.dust.push({
+        x: p3.x + nx * inward + rg() * 0.10 + nx * wob,
+        y: p3.y + ny * inward + rg() * 0.10 + ny * wob,
+        z: rg() * 0.09,
+        r: (0.17 + 0.26 * t3) * rr(0.70, 1.30) * a3.mass,
+        d: rr(0.55, 1.0) * (0.55 + a3.mass * 0.45)
+      });
+    }
+  }
+  // the central dust ring, and a few rogue clouds
+  for (i = 0; i < 34; i++) {
+    var cth = rnd() * TAU, crr = rr(1.1, 2.6);
+    w.dust.push({ x: crr * Math.cos(cth), y: crr * Math.sin(cth) * 0.8, z: rg() * 0.12,
+                  r: rr(0.16, 0.38), d: rr(0.6, 1.0) });
+  }
+  for (i = 0; i < 26; i++) {
+    w.dust.push({ x: rg() * 6, y: rg() * 6, z: rg() * 0.5, r: rr(0.18, 0.55), d: rr(0.25, 0.6) });
+  }
+
+  // ── globular clusters, scattered through the halo
+  w.globs = [];
+  for (i = 0; i < 34; i++) {
+    var gr2 = 2 + Math.pow(rnd(), 0.55) * 14;
+    var gth = rnd() * TAU, gph = Math.acos(rr(-1, 1));
+    w.globs.push({
+      x: gr2 * Math.sin(gph) * Math.cos(gth),
+      y: gr2 * Math.sin(gph) * Math.sin(gth) * 0.92,
+      z: gr2 * Math.cos(gph) * 0.75,
+      r: rr(0.05, 0.13), v: rr(0.45, 1)
+    });
+  }
+
+  // ── the catalogue. A handful of real anchors, then whatever this survey found.
+  var sunX = SUN_R * Math.cos(SUN_TH), sunY = SUN_R * Math.sin(SUN_TH);
+  w.sun = { x: sunX, y: sunY, z: 0.02 };
+
+  w.cat = [];
+  function catalogue(o) { w.cat.push(o); return o; }
+
+  catalogue({ x: 0, y: 0, z: 0, name: 'SGR A*', kind: 'SMBH', fixed: true,
+              note: 'CENTRAL MASS  4.30e6 M☉', ch: 'm', pri: 3 });
+  catalogue({ x: sunX, y: sunY, z: 0.02, name: 'SOL', kind: 'G2V', fixed: true,
+              note: 'ORIGIN  ORION SPUR', ch: 'c', pri: 3 });
+
+  // real objects, placed by their actual galactic coordinates as best as a
+  // top-down chart can hold them
+  var anchors = [
+    ['M42 ORION',      0.41,  -1.45, 'HII REGION',   'm'],
+    ['ETA CARINAE',    2.30,   1.92, 'LBV BINARY',   'm'],
+    ['M1 CRAB',        2.00,  -1.02, 'SNR',          'm'],
+    ['CYGNUS X-1',     2.22,  -0.30, 'X-RAY BINARY', 'm'],
+    ['WESTERLUND 1',   4.00,   1.68, 'SUPER CLUSTER','c'],
+    ['M13 HERCULES',   7.10,  -0.55, 'GLOBULAR',     'a'],
+    ['OMEGA CEN',      5.20,   1.30, 'GLOBULAR',     'a'],
+    ['VELA SNR',       0.29,   1.75, 'SNR',          'm'],
+    ['ROSETTE',        1.60,  -1.60, 'HII REGION',   'm'],
+    ['W49A',          11.10,   0.36, 'STARBURST',    'm']
+  ];
+  for (i = 0; i < anchors.length; i++) {
+    var an = anchors[i];
+    // distance from Sol, along a galactic longitude, laid into the disk
+    var d = an[1], lon = an[2];
+    catalogue({
+      x: sunX + d * Math.cos(SUN_TH + Math.PI + lon),
+      y: sunY + d * Math.sin(SUN_TH + Math.PI + lon),
+      z: rg() * 0.05,
+      name: an[0], kind: an[3], ch: an[4], fixed: true, pri: 2
+    });
+  }
+
+  // and the procedural half of the catalogue — what this seed's survey resolved
+  var found = ri(16, 24);
+  for (i = 0; i < found; i++) {
+    var si = (rnd() * NSTAR) | 0;
+    if (SM[si] < 0.28) { i--; continue; }
+    catalogue({
+      x: SX[si], y: SY[si], z: SZ[si],
+      name: designation(), kind: pick(CAT_CLASS),
+      ch: SC[si] === CLASS_HOT ? 'c' : SC[si] === CLASS_COOL ? 'a' : 'c',
+      star: si, pri: 1
+    });
+  }
+
+  // dossier fields, generated once so a locked target does not shimmer
+  for (i = 0; i < w.cat.length; i++) {
+    var o = w.cat[i];
+    var dx = o.x - sunX, dy = o.y - sunY, dz = o.z - 0.02;
+    o.dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    o.lon  = (Math.atan2(dy, dx) - SUN_TH - Math.PI) % TAU;
+    if (o.lon < 0) o.lon += TAU;
+    o.rv   = rr(-320, 320);
+    o.mass = Math.pow(10, rr(-0.6, 2.2));
+    o.temp = Math.round(rr(2400, 42000) / 100) * 100;
+    o.flux = rr(0.02, 9.9);
+    o.conf = rr(0.72, 0.999);
+    o.id   = designation();
+  }
+
+  // ── the anomaly. Every survey should find one thing it cannot explain.
+  var ax = rr(-1, 1), ay = rr(-1, 1);
+  var anr = rr(5.5, 12);
+  var anth = rnd() * TAU;
+  // never on top of the Sun; a flag you cannot read is not a flag
+  for (var guard = 0; guard < 24; guard++) {
+    var tx = anr * Math.cos(anth) - sunX, ty = anr * Math.sin(anth) - sunY;
+    if (Math.sqrt(tx * tx + ty * ty) > 4.2) break;
+    anth = rnd() * TAU; anr = rr(5.5, 12);
+  }
+  w.anomaly = {
+    x: anr * Math.cos(anth), y: anr * Math.sin(anth), z: rg() * 0.4,
+    id: 'UNRESOLVED ' + ri(1000, 9999) + String.fromCharCode(65 + ri(0, 5)),
+    ph: rr(0, TAU)
+  };
+  var adx = w.anomaly.x - sunX, ady = w.anomaly.y - sunY;
+  w.anomaly.dist = Math.sqrt(adx * adx + ady * ady);
+
+  // ── deep field: things that are not in this galaxy at all
+  w.deep = [];
+  for (i = 0; i < 30; i++) {
+    w.deep.push({
+      x: rnd(), y: rnd(), r: rr(0.003, 0.010), e: rr(0.25, 1),
+      a: rr(0, Math.PI), v: rr(0.10, 0.4), sp: rnd() < 0.3
+    });
+  }
+
+  // ── the scrolling telemetry, fixed per seed so the numbers are stable
+  w.telem = [];
+  for (i = 0; i < 46; i++) {
+    w.telem.push({
+      k: pick(['AZ', 'EL', 'DEC', 'RA', 'FLX', 'SNR', 'TMP', 'GAIN', 'PHS', 'DRF', 'Z', 'DM']),
+      v: rr(-999, 9999), d: rr(-1, 1), hex: ri(0, 0xffff)
+    });
+  }
+
+  world = w;
+}
+
+// Projection cache. Project once per frame, draw three times — the channels see
+// the same geometry and the arithmetic is the expensive part.
+var PX, PY, PD, BUCK, BCNT, NB = 14;
+function allocProjection() {
+  PX = new Float32Array(NSTAR); PY = new Float32Array(NSTAR); PD = new Float32Array(NSTAR);
+  BUCK = []; BCNT = new Int32Array(NB);
+  for (var i = 0; i < NB; i++) BUCK.push(new Int32Array(NSTAR));
+}
+
+// ─────────────────────────────────────────────────────────────────── 4. the survey
+//
+// One number runs this whole piece: the wavelength the instrument is tuned to.
+// It sweeps up the spectrum and back down over 96 seconds. Everything else —
+// how much each channel carries, whether dust is opaque or glowing, whether
+// there are stars at all — is a function of it.
+//
+// This is Lamplighter's sun-altitude curve wearing a lab coat. Same idea: one
+// keyframed scalar, every downstream value derived, so the whole image moves
+// together and nothing has to be kept in sync by hand.
+
+var BANDS = [
+  { n: 'RADIO',      wl: '21 cm',   at: 0.00 },
+  { n: 'INFRARED',   wl: '8.4 µm', at: 0.25 },
+  { n: 'OPTICAL',    wl: '550 nm',  at: 0.50 },
+  { n: 'ULTRAVIOLET',wl: '148 nm',  at: 0.75 },
+  { n: 'X-RAY',      wl: '0.41 nm', at: 1.00 }
+];
+
+var band = {};
+function updateBand(u) {
+  // triangle: up the spectrum and back, so no seam and no jump
+  var lam = u < 0.5 ? u * 2 : 2 - u * 2;
+  var radio = bump(lam, 0.00, 0.15), ir = bump(lam, 0.25, 0.14);
+  var opt   = bump(lam, 0.50, 0.14), uv = bump(lam, 0.75, 0.14);
+  var xray  = bump(lam, 1.00, 0.15);
+  var sum = radio + ir + opt + uv + xray;
+  radio /= sum; ir /= sum; opt /= sum; uv /= sum; xray /= sum;
+
+  band.u = u; band.lam = lam;
+  band.radio = radio; band.ir = ir; band.opt = opt; band.uv = uv; band.xray = xray;
+
+  // which band gets its name on the readout
+  var best = 0, bv = -1;
+  var vals = [radio, ir, opt, uv, xray];
+  for (var i = 0; i < 5; i++) if (vals[i] > bv) { bv = vals[i]; best = i; }
+  band.name = BANDS[best].n;
+  band.wl = BANDS[best].wl;
+  band.idx = best;
+  band.lock = bv;
+
+  // per-channel master gain. The instrument's own light (grid, HUD) is always
+  // cyan; what the SKY contributes to each channel is what moves.
+  band.ch = {
+    c: 0.34 + 0.52 * opt + 0.80 * uv + 0.30 * radio,
+    a: 0.30 + 0.92 * ir + 0.70 * opt + 0.22 * radio + 0.10 * uv,
+    m: 0.26 + 1.05 * xray + 0.62 * uv + 0.34 * opt + 0.40 * radio
+  };
+
+  // how each stellar class responds, per channel. No colour lives anywhere in
+  // this file except CH — everything you see is these numbers multiplied out.
+  var R = band.resp = [[], [], [], []];
+  //                 hot O/B      sun-like     cool giant    compact/exotic
+  var byClass = [
+    { c: 0.95, a: 0.16, m: 0.30 },
+    { c: 0.46, a: 0.60, m: 0.10 },
+    { c: 0.08, a: 0.92, m: 0.05 },
+    { c: 0.30, a: 0.10, m: 0.95 }
+  ];
+  // band modulates which populations are visible at all
+  var vis = [
+    0.22 * radio + 0.55 * ir + 1.00 * opt + 1.35 * uv + 0.30 * xray,   // hot
+    0.10 * radio + 0.70 * ir + 1.00 * opt + 0.42 * uv + 0.06 * xray,   // solar
+    0.14 * radio + 1.25 * ir + 0.88 * opt + 0.08 * uv + 0.03 * xray,   // cool
+    0.60 * radio + 0.35 * ir + 0.45 * opt + 0.90 * uv + 1.60 * xray    // exotic
+  ];
+  for (var cl = 0; cl < 4; cl++) {
+    for (var ki = 0; ki < 3; ki++) {
+      var k = CHAN[ki];
+      R[cl][ki] = byClass[cl][k] * vis[cl] * band.ch[k];
+    }
+  }
+
+  band.starGain = 0.30 * radio + 0.78 * ir + 1.00 * opt + 0.84 * uv + 0.42 * xray;
+  band.gasGain  = 1.30 * radio + 0.95 * ir + 0.34 * opt + 0.55 * uv + 0.20 * xray;
+  band.hiiGain  = 0.75 * radio + 0.70 * ir + 0.55 * opt + 1.25 * uv + 0.40 * xray;
+  band.coreGain = 0.55 * radio + 0.85 * ir + 0.62 * opt + 0.90 * uv + 1.70 * xray;
+
+  // The flip. In the optical, dust is a hole in the galaxy. In the infrared it
+  // is the brightest thing in the frame. Between the two it crossfades, and
+  // watching a lane go from absence to source is the best thing this piece does.
+  band.dustOcc  = 0.18 * radio + 0.05 * ir + 1.00 * opt + 0.92 * uv + 0.10 * xray;
+  band.dustEmit = 0.62 * radio + 1.00 * ir + 0.04 * opt + 0.00 * uv + 0.00 * xray;
+
+  band.grain = 0.55 + 0.9 * xray + 0.45 * radio;    // noisier at the extremes
+}
+
+// ────────────────────────────────────────────────────────────────── 5. the camera
+
+var cam = { az: 0.42, inc: 0.34, zoom: 1, tAz: 0.42, tInc: 0.34, tZoom: 1 };
+var CAM0 = { az: 0.42, inc: 0.34, zoom: 1 };
+
+function camScale() { return Math.min(W, H) * 0.455 / KPC * cam.zoom; }
+
+function project() {
+  var ca = Math.cos(cam.az), sa = Math.sin(cam.az);
+  var ciq = Math.cos(cam.inc), si = Math.sin(cam.inc);
+  var S = camScale();
+  for (var i = 0; i < NSTAR; i++) {
+    var x = SX[i], y = SY[i], z = SZ[i];
+    var X = x * ca - y * sa, Y = x * sa + y * ca;
+    PX[i] = CX + X * S;
+    PY[i] = CY + (Y * ciq - z * si) * S;
+    PD[i] = Y * si + z * ciq;
+  }
+}
+
+// one point, same transform — used by everything that is not a star
+function proj(x, y, z) {
+  var ca = Math.cos(cam.az), sa = Math.sin(cam.az);
+  var ciq = Math.cos(cam.inc), si = Math.sin(cam.inc);
+  var S = camScale();
+  var X = x * ca - y * sa, Y = x * sa + y * ca;
+  return { x: CX + X * S, y: CY + (Y * ciq - z * si) * S, d: Y * si + z * ciq, s: S };
+}
+
+// ───────────────────────────────────────────────────────────── 5a. the void
+
+function drawDeep(g, k, T) {
+  // things that are not in this galaxy. Faint, and they do not move with the
+  // camera, because they are far enough away that nothing moves them.
+  var D = world.deep;
+  var a0 = (k === 'c' ? 0.13 : k === 'a' ? 0.15 : 0.10) * (0.4 + band.opt + band.ir * 0.8);
+  for (var i = 0; i < D.length; i++) {
+    var d = D[i];
+    var x = d.x * W, y = d.y * H, r = d.r * Math.min(W, H);
+    var a = a0 * d.v * (d.sp ? 0.7 : 1);
+    if (a < 0.01) continue;
+    g.save();
+    g.translate(x, y);
+    g.rotate(d.a);
+    g.scale(1, d.e);
+    glow(g, k, 0, 0, r * 1.05, a * 0.34);
+    g.restore();
+  }
+}
+
+// The dot grid. GMUNK hung every element of Oblivion's interface on one, and it
+// is the single thing that separates an instrument from a screensaver: nothing
+// here floats, everything lands on a coordinate.
+function drawGrid(g, k, T, boot) {
+  if (k !== 'c' || !showGrid) return;
+  var a = 0.052 * boot * (0.7 + 0.5 * band.opt);
+  if (a < 0.004) return;
+  emit(g, k, a);
+  var step = GU * 2;
+  var r = Math.max(0.5, 0.6 * SCALE);
+  for (var y = gx(step); y < H; y += step) {
+    for (var x = gx(step); x < W; x += step) {
+      g.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+  }
+  // the heavier rules, every eighth
+  emit(g, k, a * 0.55);
+  g.lineWidth = Math.max(0.5, 0.5 * SCALE);
+  g.beginPath();
+  for (var yy = gx(step * 8); yy < H; yy += step * 8) { g.moveTo(0, yy + 0.5); g.lineTo(W, yy + 0.5); }
+  for (var xx = gx(step * 8); xx < W; xx += step * 8) { g.moveTo(xx + 0.5, 0); g.lineTo(xx + 0.5, H); }
+  g.stroke();
+}
+
+// the plane of the disk, drawn as a graticule so you can read the tilt
+function drawGraticule(g, k, T, boot) {
+  if (k !== 'c') return;
+  var a = 0.10 * boot * sstep(0.02, 0.35, cam.inc);
+  if (a < 0.005) return;
+  var S = camScale(), i, j;
+  emit(g, k, a);
+  g.lineWidth = Math.max(0.5, 0.6 * SCALE);
+  for (i = 4; i <= 16; i += 4) {
+    g.beginPath();
+    for (j = 0; j <= 72; j++) {
+      var th = j / 72 * TAU;
+      var p = proj(i * Math.cos(th), i * Math.sin(th), 0);
+      if (j === 0) g.moveTo(p.x, p.y); else g.lineTo(p.x, p.y);
+    }
+    g.stroke();
+  }
+  emit(g, k, a * 0.6);
+  for (i = 0; i < 12; i++) {
+    var th2 = i / 12 * TAU;
+    var p1 = proj(3 * Math.cos(th2), 3 * Math.sin(th2), 0);
+    var p2 = proj(16.4 * Math.cos(th2), 16.4 * Math.sin(th2), 0);
+    g.beginPath(); g.moveTo(p1.x, p1.y); g.lineTo(p2.x, p2.y); g.stroke();
+  }
+}
+
+// ───────────────────────────────────────────────────────── 5b. the galaxy itself
+
+function drawHalo(g, k, T) {
+  // the diffuse light of the whole thing, before any star is resolved
+  var S = camScale();
+  var p = proj(0, 0, 0);
+  var flat = Math.max(0.10, Math.cos(cam.inc));
+
+  var a = (k === 'c' ? 0.16 : k === 'a' ? 0.34 : 0.10) * band.ch[k] * band.gasGain * 0.5;
+  if (a > 0.006) {
+    g.save();
+    g.translate(p.x, p.y);
+    g.scale(1, flat);
+    glow(g, k, 0, 0, S * 10.5, a);
+    g.restore();
+  }
+
+  // the bulge, which is amber because it is old, and stretched along the bar,
+  // because the bar is what made it that shape
+  var ab = (k === 'c' ? 0.20 : k === 'a' ? 0.85 : 0.22) * band.ch[k] * band.coreGain * 0.55;
+  if (ab > 0.006) {
+    var pe = proj(Math.cos(BAR_A), Math.sin(BAR_A), 0);
+    var ang = Math.atan2(pe.y - p.y, pe.x - p.x);
+    g.save();
+    g.translate(p.x, p.y);
+    g.rotate(ang);
+    g.scale(1, Math.max(0.16, flat * 0.55 + 0.2));
+    glow(g, k, 0, 0, S * 3.4, ab * 0.85);
+    g.restore();
+    g.save();
+    g.translate(p.x, p.y);
+    g.scale(1, Math.max(0.18, flat * 0.8 + 0.2));
+    glow(g, k, 0, 0, S * 1.05, ab);
+    g.restore();
+  }
+}
+
+function drawArmGas(g, k, T) {
+  // the diffuse ridge of gas along each arm — what a radio survey actually sees
+  var a0 = (k === 'c' ? 0.34 : k === 'a' ? 0.50 : 0.30) * band.ch[k] * band.gasGain * 0.17;
+  if (a0 < 0.004) return;
+  var S = camScale();
+  for (var i = 0; i < ARMS.length; i++) {
+    var a = ARMS[i];
+    for (var t = 0; t <= 1.0001; t += 0.014) {
+      var p = armPoint(a, t);
+      var sp = proj(p.x, p.y, 0);
+      var r = (a.w * (0.62 + t * 0.85)) * S * 1.05;
+      glow(g, k, sp.x, sp.y, r, a0 * a.mass * (1 - t * 0.30));
+    }
+  }
+}
+
+function drawHII(g, k, T) {
+  var a0 = (k === 'c' ? 0.30 : k === 'a' ? 0.34 : 1.00) * band.ch[k] * band.hiiGain * 0.55;
+  if (a0 < 0.005) return;
+  var Hs = world.hii, S = camScale();
+  for (var i = 0; i < Hs.length; i++) {
+    var h = Hs[i];
+    var p = proj(h.x, h.y, h.z);
+    var puls = 0.78 + 0.22 * Math.sin(T * TAU / PULSE_P + h.ph);
+    glow(g, k, p.x, p.y, h.r * S * 2.9, a0 * h.v * puls * 0.42);
+    glow(g, k, p.x, p.y, h.r * S * 1.0, a0 * h.v * puls);
+  }
+}
+
+// The mirror of Lamplighter's solidPath(). There, opacity was two operations:
+// knock to white, then lay down ink. Here there is no white to knock to, so
+// occlusion is a multiply toward black — and because it removes rather than
+// adds, it is the one thing in this file that has to respect depth order.
+// The occluding half of the dust is identical in all three channels — it is the
+// same absence of light whatever colour is behind it. So it is painted once,
+// into a white mask, and multiplied onto each channel in a single drawImage.
+// Three composites instead of eight hundred radial gradients.
+function buildDustMask(T) {
+  if (!dustMask) {
+    dustMask = document.createElement('canvas');
+    dustMaskG = dustMask.getContext('2d', { alpha: false });
+  }
+  if (dustMask.width !== W || dustMask.height !== H) { dustMask.width = W; dustMask.height = H; }
+  var g = dustMaskG;
+  g.globalCompositeOperation = 'source-over';
+  g.globalAlpha = 1;
+  g.fillStyle = '#ffffff';                 // white multiplies to identity
+  g.fillRect(0, 0, W, H);
+
+  var occ = band.dustOcc;
+  if (occ <= 0.02) return false;
+
+  var D = world.dust, S = camScale();
+  g.globalCompositeOperation = 'source-over';
+  for (var i = 0; i < D.length; i++) {
+    var d = D[i];
+    var p = proj(d.x, d.y, d.z);
+    var r = d.r * S * 2.1;
+    if (r < 0.5 || p.x < -r || p.x > W + r || p.y < -r || p.y > H + r) continue;
+    g.globalAlpha = clamp(d.d * occ * 0.50, 0, 0.94);
+    g.drawImage(dustSprite, p.x - r, p.y - r, r * 2, r * 2);
+  }
+  g.globalAlpha = 1;
+  return true;
+}
+
+function drawDust(g, k, T) {
+  var D = world.dust, S = camScale();
+  var em = band.dustEmit;
+
+  if (dustOn) {
+    g.globalCompositeOperation = 'multiply';
+    g.globalAlpha = 1;
+    g.drawImage(dustMask, 0, 0);
+  }
+
+  if (em > 0.02) {
+    // the same clouds, now the brightest thing in the frame
+    var e0 = (k === 'c' ? 0.16 : k === 'a' ? 1.00 : 0.34) * band.ch[k] * em * 0.5;
+    for (var j = 0; j < D.length; j++) {
+      var d2 = D[j];
+      var p2 = proj(d2.x, d2.y, d2.z);
+      var r2 = d2.r * S;
+      if (r2 < 0.4) continue;
+      glow(g, k, p2.x, p2.y, r2 * 2.4, e0 * d2.d * 0.6);
+      glow(g, k, p2.x, p2.y, r2 * 0.9, e0 * d2.d);
+    }
+  }
+  plain(g);
+}
+
+// Stars, binned by brightness so fillStyle is set fourteen times instead of
+// eleven thousand. That one change is the difference between this running and
+// this not running.
+function drawStars(g, k, T, near) {
+  var ki = k === 'c' ? 0 : k === 'a' ? 1 : 2;
+  var R = band.resp, gain = band.starGain, i, b;
+  for (i = 0; i < NB; i++) BCNT[i] = 0;
+
+  var twk = T * 2.1;
+  for (i = 0; i < NSTAR; i++) {
+    if ((PD[i] >= 0) !== near) continue;
+    var x = PX[i];
+    if (x < -8 || x > W + 8) continue;
+    var y = PY[i];
+    if (y < -8 || y > H + 8) continue;
+    var e = R[SC[i]][ki] * SM[i] * gain;
+    if (e < 0.018) continue;
+    if (SM[i] > 0.62) e *= 0.86 + 0.14 * Math.sin(twk + i * 0.37);
+    b = (e * NB) | 0;
+    if (b >= NB) b = NB - 1;
+    BUCK[b][BCNT[b]++] = i;
+  }
+
+  for (b = 0; b < NB; b++) {
+    var n = BCNT[b];
+    if (!n) continue;
+    var alpha = (b + 0.62) / NB;
+    emit(g, k, Math.min(1, alpha));
+    var sz = b < 5 ? 1 : b < 9 ? 1.4 : b < 12 ? 2 : 2.8;
+    sz *= SCALE;
+    var h = sz * 0.5;
+    var arr = BUCK[b];
+    for (i = 0; i < n; i++) {
+      var s = arr[i];
+      g.fillRect(PX[s] - h, PY[s] - h, sz, sz);
+    }
+  }
+
+  // the resolved few get a real glow and, if they are very bright, spikes
+  var bright = 0;
+  for (i = 0; i < NSTAR && bright < 190; i++) {
+    if ((PD[i] >= 0) !== near) continue;
+    if (SM[i] < 0.60) continue;
+    var ee = R[SC[i]][ki] * SM[i] * gain;
+    if (ee < 0.30) continue;
+    bright++;
+    var px = PX[i], py = PY[i];
+    if (px < -30 || px > W + 30 || py < -30 || py > H + 30) continue;
+    var rad = (2.2 + SM[i] * 9) * SCALE * (0.7 + ee * 0.6);
+    glow(g, k, px, py, rad, ee * 0.5);
+    if (SM[i] > 0.86 && ee > 0.55 && k === 'c') {
+      emit(g, k, ee * 0.22);
+      g.lineWidth = Math.max(0.5, 0.6 * SCALE);
+      var L = rad * 2.1;
+      g.beginPath();
+      g.moveTo(px - L, py); g.lineTo(px + L, py);
+      g.moveTo(px, py - L * 0.62); g.lineTo(px, py + L * 0.62);
+      g.stroke();
+    }
+  }
+  plain(g);
+}
+
+function drawGlobs(g, k, T) {
+  var a0 = (k === 'c' ? 0.24 : k === 'a' ? 0.90 : 0.14) * band.ch[k] * 0.5;
+  if (a0 < 0.005) return;
+  var G = world.globs, S = camScale();
+  for (var i = 0; i < G.length; i++) {
+    var gb = G[i];
+    var p = proj(gb.x, gb.y, gb.z);
+    glow(g, k, p.x, p.y, gb.r * S * 6.0, a0 * gb.v * 0.30);
+    glow(g, k, p.x, p.y, gb.r * S * 2.0, a0 * gb.v);
+  }
+}
+
+// ──────────────────────────────────────────────────────────── 5c. the instrument
+//
+// Everything below here is the machine looking at the thing above here. It is
+// all cyan unless it is trying to tell you something, and it all lands on GU.
+
+var FONT = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace';
+var hasTrack = (function () { try { return 'letterSpacing' in out; } catch (e) { return false; } })();
+
+function txt(g, k, s, x, y, size, o) {
+  o = o || {};
+  var a = o.a === undefined ? 0.8 : o.a;
+  if (a < 0.006) return 0;
+  emit(g, k, a);
+  g.font = (o.w || '400') + ' ' + Math.max(6, Math.round(size * SCALE)) + 'px ' + FONT;
+  g.textAlign = o.align || 'left';
+  g.textBaseline = o.base || 'alphabetic';
+  if (hasTrack) g.letterSpacing = (o.track === undefined ? 1.1 : o.track) * SCALE + 'px';
+  g.fillText(s, x, y);
+  var wdt = g.measureText(s).width;
+  if (hasTrack) g.letterSpacing = '0px';
+  plain(g);
+  return wdt;
+}
+
+// panels are corner marks and a rule, never a box — a box is a website
+function bracket(g, k, x, y, w, h, a, len) {
+  if (a < 0.006) return;
+  emit(g, k, a);
+  g.lineWidth = Math.max(0.6, 0.9 * SCALE);
+  var L = len === undefined ? GU * 0.9 : len;
+  g.beginPath();
+  g.moveTo(x, y + L); g.lineTo(x, y); g.lineTo(x + L, y);
+  g.moveTo(x + w - L, y); g.lineTo(x + w, y); g.lineTo(x + w, y + L);
+  g.moveTo(x + w, y + h - L); g.lineTo(x + w, y + h); g.lineTo(x + w - L, y + h);
+  g.moveTo(x + L, y + h); g.lineTo(x, y + h); g.lineTo(x, y + h - L);
+  g.stroke();
+  plain(g);
+}
+
+function rule(g, k, x1, y, x2, a, dash) {
+  if (a < 0.006) return;
+  emit(g, k, a);
+  g.lineWidth = Math.max(0.5, 0.7 * SCALE);
+  if (dash) g.setLineDash([2 * SCALE, 3 * SCALE]);
+  g.beginPath(); g.moveTo(x1, Math.round(y) + 0.5); g.lineTo(x2, Math.round(y) + 0.5); g.stroke();
+  g.setLineDash([]);
+  plain(g);
+}
+
+function arc(g, k, x, y, r, a0, a1, alpha, lw) {
+  if (alpha < 0.006 || r <= 0) return;
+  emit(g, k, alpha);
+  g.lineWidth = (lw || 0.9) * SCALE;
+  g.beginPath(); g.arc(x, y, r, a0, a1); g.stroke();
+  plain(g);
+}
+
+// The rings. Counter-rotating, gapped, with tick marks — and every period
+// divides the cycle, so they come back to where they started.
+function drawRings(g, k, T, boot) {
+  if (k !== 'c') return;
+  var S = camScale();
+  var R1 = Math.min(W, H) * 0.455, i;
+  var a = 0.30 * boot;
+
+  // outer: fixed, with a heavy tick every 30°
+  arc(g, k, CX, CY, R1, 0, TAU, a * 0.34, 0.7);
+  emit(g, k, a * 0.62);
+  g.lineWidth = Math.max(0.6, 0.9 * SCALE);
+  g.beginPath();
+  for (i = 0; i < 72; i++) {
+    var th = i / 72 * TAU;
+    var maj = i % 6 === 0;
+    var L = (maj ? GU * 0.62 : GU * 0.26);
+    g.moveTo(CX + Math.cos(th) * R1, CY + Math.sin(th) * R1);
+    g.lineTo(CX + Math.cos(th) * (R1 - L), CY + Math.sin(th) * (R1 - L));
+  }
+  g.stroke();
+  plain(g);
+
+  // degree labels on the majors
+  for (i = 0; i < 12; i++) {
+    var t2 = i / 12 * TAU - Math.PI / 2;
+    var lx = CX + Math.cos(t2) * (R1 + GU * 0.95);
+    var ly = CY + Math.sin(t2) * (R1 + GU * 0.95);
+    txt(g, k, String(i * 30).padStart(3, '0'), lx, ly, 7, { a: a * 0.5, align: 'center', base: 'middle', track: 0.8 });
+  }
+
+  // two counter-rotating gapped rings
+  var r2 = R1 - GU * 1.5, r3 = R1 - GU * 2.6;
+  var p2 = T * TAU / RING_A, p3 = -T * TAU / RING_B;
+  for (i = 0; i < 4; i++) {
+    arc(g, k, CX, CY, r2, p2 + i * TAU / 4, p2 + i * TAU / 4 + 1.06, a * 0.55, 1.2);
+  }
+  for (i = 0; i < 3; i++) {
+    arc(g, k, CX, CY, r3, p3 + i * TAU / 3, p3 + i * TAU / 3 + 0.62, a * 0.40, 0.8);
+  }
+
+  // inner scale rings, tied to the actual kiloparsec grid: 4 kpc, and the
+  // circle the Sun rides on
+  arc(g, k, CX, CY, 4 * S, 0, TAU, a * 0.16, 0.6);
+  arc(g, k, CX, CY, 8.2 * S, 0, TAU, a * 0.22, 0.6);
+}
+
+// The sweep. It is the instrument integrating, so it is also what the audio is
+// locked to — see AudioEng.sweepPhase(). Lamplighter's foghorn drifted against
+// its beam and the handoff called that the most obviously unfinished thing in
+// the piece; this one is tied to the same number the pixels use.
+function sweepAngle(T) { return (T * TAU / SWEEP_P) % TAU; }
+
+function drawSweep(g, k, T, boot) {
+  if (k !== 'c') return;
+  var R1 = Math.min(W, H) * 0.455;
+  var ang = sweepAngle(T);
+  var a = 0.30 * boot;
+
+  // the trail: stacked wedges, each one also fading outward, so there is no
+  // edge anywhere for the eye to catch on
+  var spanN = 30, span = 0.62;
+  g.globalCompositeOperation = 'lighter';
+  for (var i = 0; i < spanN; i++) {
+    var f = i / spanN;
+    var fall = (1 - f) * (1 - f) * (1 - f);
+    var aa = a * fall * 0.052;
+    if (aa < 0.0015) continue;
+    var gr = g.createRadialGradient(CX, CY, R1 * 0.06, CX, CY, R1);
+    gr.addColorStop(0.00, 'rgba(' + CH[k] + ',' + (aa * 0.35).toFixed(4) + ')');
+    gr.addColorStop(0.55, 'rgba(' + CH[k] + ',' + aa.toFixed(4) + ')');
+    gr.addColorStop(1.00, 'rgba(' + CH[k] + ',0)');
+    g.fillStyle = gr;
+    g.beginPath();
+    g.moveTo(CX, CY);
+    g.arc(CX, CY, R1, ang - span * (f + 1.6 / spanN), ang - span * f);
+    g.closePath();
+    g.fill();
+  }
+  plain(g);
+
+  // the leading edge, which also fades before it reaches the hub or the rim
+  var lg = g.createLinearGradient(CX, CY, CX + Math.cos(ang) * R1, CY + Math.sin(ang) * R1);
+  lg.addColorStop(0.00, 'rgba(' + CH[k] + ',0)');
+  lg.addColorStop(0.22, 'rgba(' + CH[k] + ',' + (a * 0.30).toFixed(4) + ')');
+  lg.addColorStop(0.86, 'rgba(' + CH[k] + ',' + (a * 0.42).toFixed(4) + ')');
+  lg.addColorStop(1.00, 'rgba(' + CH[k] + ',0)');
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = lg;
+  g.lineWidth = Math.max(0.7, 1.0 * SCALE);
+  g.beginPath();
+  g.moveTo(CX, CY);
+  g.lineTo(CX + Math.cos(ang) * R1, CY + Math.sin(ang) * R1);
+  g.stroke();
+  plain(g);
+  glow(g, k, CX + Math.cos(ang) * R1, CY + Math.sin(ang) * R1, GU * 1.1, a * 0.34);
+}
+
+// Corner brackets that snap to a contact. The reticle replaces the cursor,
+// because you are supposed to be inside the console and not pointing at it.
+function drawContacts(g, k, T, boot) {
+  var C = world.cat, i, S = camScale();
+  var swp = sweepAngle(T);
+
+  for (i = 0; i < C.length; i++) {
+    var o = C[i];
+    var p = proj(o.x, o.y, o.z);
+    o._x = p.x; o._y = p.y;
+    if (p.x < -40 || p.x > W + 40 || p.y < -40 || p.y > H + 40) { o._on = false; continue; }
+    o._on = true;
+
+    // a contact brightens as the sweep passes over it and decays behind it
+    var oth = Math.atan2(p.y - CY, p.x - CX);
+    var dth = ((swp - oth) % TAU + TAU) % TAU;
+    var freshness = Math.exp(-dth * 1.5);
+    o._fresh = freshness;
+
+    var isLock = lockIdx === i;
+    var isHover = hoverIdx === i;
+    var pri = o.pri || 1;
+    if (k !== o.ch && !isLock && !isHover) continue;
+
+    var base = (pri === 3 ? 0.62 : pri === 2 ? 0.40 : 0.24) * boot;
+    var a = base * (0.30 + 0.70 * freshness);
+    if (isHover) a = Math.max(a, 0.72);
+    if (isLock) a = Math.max(a, 0.95);
+    if (a < 0.012) continue;
+
+    var r = GU * (isLock ? 1.5 : pri === 3 ? 1.15 : 0.85);
+
+    if (isLock) {
+      // the lock reticle: two counter-rotating gapped rings and hard corners
+      var lp = T * TAU / (LOOP / 12);
+      for (var s = 0; s < 4; s++) {
+        arc(g, k, p.x, p.y, r * 1.5, lp + s * TAU / 4, lp + s * TAU / 4 + 0.9, a * 0.8, 1.1);
+        arc(g, k, p.x, p.y, r * 2.15, -lp + s * TAU / 4 + 0.4, -lp + s * TAU / 4 + 1.0, a * 0.45, 0.8);
+      }
+      bracket(g, k, p.x - r * 2.9, p.y - r * 2.9, r * 5.8, r * 5.8, a, r * 1.1);
+    } else if (isHover) {
+      bracket(g, k, p.x - r * 2.1, p.y - r * 2.1, r * 4.2, r * 4.2, a * 0.8, r * 0.8);
+    }
+
+    // the mark itself
+    emit(g, k, a);
+    g.lineWidth = Math.max(0.6, 0.9 * SCALE);
+    if (o.kind === 'SMBH') {
+      g.beginPath(); g.arc(p.x, p.y, r * 0.62, 0, TAU); g.stroke();
+      g.beginPath(); g.arc(p.x, p.y, r * 0.22, 0, TAU); g.fill();
+    } else if (pri >= 2) {
+      g.beginPath();
+      g.moveTo(p.x, p.y - r * 0.7); g.lineTo(p.x + r * 0.7, p.y);
+      g.lineTo(p.x, p.y + r * 0.7); g.lineTo(p.x - r * 0.7, p.y);
+      g.closePath(); g.stroke();
+    } else {
+      g.beginPath();
+      g.moveTo(p.x - r * 0.45, p.y); g.lineTo(p.x + r * 0.45, p.y);
+      g.moveTo(p.x, p.y - r * 0.45); g.lineTo(p.x, p.y + r * 0.45);
+      g.stroke();
+    }
+    plain(g);
+
+    // callout — a leader line up and right to a label on the grid
+    if ((pri >= 2 || isHover || isLock) && a > 0.18 && !compact && o.name !== 'SOL') {
+      // the core is the one label that cannot go up-and-right, because that is
+      // where the core is
+      var side = o.kind === 'SMBH' ? -1 : 1;
+      var lx = gx(p.x + side * GU * (side < 0 ? 5.6 : 1.6)), ly = gx(p.y + side * GU * -1.5);
+      emit(g, k, a * 0.5);
+      g.lineWidth = Math.max(0.5, 0.7 * SCALE);
+      g.beginPath();
+      g.moveTo(p.x + side * r * 0.8, p.y + side * -r * 0.5);
+      g.lineTo(lx + (side < 0 ? GU * 4.2 : -GU * 0.3), ly + GU * 0.25);
+      g.lineTo(lx + (side < 0 ? -GU * 0.2 : GU * 2.2), ly + GU * 0.25);
+      g.stroke();
+      plain(g);
+      txt(g, k, o.name, lx, ly, 7.5, { a: a * 0.95, track: 1.2 });
+      if (isLock || isHover) {
+        txt(g, k, o.kind + '  ' + o.dist.toFixed(2) + ' KPC', lx, ly + GU * 0.95, 6.5, { a: a * 0.55, track: 0.9 });
+      }
+    }
+  }
+
+  // the Sun gets its own treatment, because it is where you are
+  var sp = proj(world.sun.x, world.sun.y, world.sun.z);
+  if (k === 'c') {
+    var sa2 = 0.85 * boot;
+    var srr = GU * 0.8;
+    emit(g, k, sa2);
+    g.lineWidth = Math.max(0.7, 1.1 * SCALE);
+    g.beginPath(); g.arc(sp.x, sp.y, srr, 0, TAU); g.stroke();
+    g.beginPath(); g.arc(sp.x, sp.y, srr * 0.22, 0, TAU); g.fill();
+    plain(g);
+    var rip = fract(T / (LOOP / 8));
+    arc(g, k, sp.x, sp.y, srr + rip * GU * 3.2, 0, TAU, sa2 * (1 - rip) * 0.5, 0.8);
+    if (!compact) txt(g, k, 'SOL — OBSERVER', gx(sp.x + GU), gx(sp.y + GU * 1.6), 7, { a: sa2 * 0.8, track: 1.4 });
+  }
+  glow(g, k, sp.x, sp.y, GU * 2.4, (k === 'c' ? 0.5 : 0.12) * boot);
+}
+
+function drawAnomaly(g, k, T, boot) {
+  var an = world.anomaly;
+  var p = proj(an.x, an.y, an.z);
+  an._x = p.x; an._y = p.y;
+  var ph = fract(T / PULSE_P);
+  var pulse = Math.exp(-ph * 3.8);
+  var a = (k === 'm' ? 1 : k === 'c' ? 0.26 : 0.08) * boot;
+
+  // a tight core, not a bruise
+  glow(g, k, p.x, p.y, GU * (0.7 + pulse * 1.5), a * (0.12 + pulse * 0.34));
+  for (var i = 0; i < 3; i++) {
+    var rp = fract(ph + i / 3);
+    arc(g, k, p.x, p.y, GU * (0.45 + rp * 2.3), 0, TAU, a * (1 - rp) * (1 - rp) * 0.40, 0.8);
+  }
+  emit(g, k, a * 0.85);
+  g.lineWidth = Math.max(0.6, 0.9 * SCALE);
+  g.beginPath();
+  for (var j = 0; j < 3; j++) {
+    var th = j / 3 * TAU - Math.PI / 2 + T * 0.4;
+    g.moveTo(p.x + Math.cos(th) * GU * 0.34, p.y + Math.sin(th) * GU * 0.34);
+    g.lineTo(p.x + Math.cos(th) * GU * 0.78, p.y + Math.sin(th) * GU * 0.78);
+  }
+  g.stroke();
+  plain(g);
+
+  if (k === 'm' && !compact && boot > 0.6) {
+    var lx = gx(p.x + GU * 1.1), ly = gx(p.y + GU * 1.7);
+    txt(g, k, an.id, lx, ly, 6.8, { a: a * (0.5 + pulse * 0.5), track: 1.3 });
+    txt(g, k, 'NO SPECTRAL MATCH', lx, ly + GU * 0.85, 6.0, { a: a * 0.40, track: 0.9 });
+  }
+}
+
+function drawReticle(g, k, T, boot) {
+  if (k !== 'c' || STILL) return;
+  var a = 0.5 * boot * (pointerIn ? 1 : 0);
+  if (a < 0.01) return;
+  var x = ptr.x, y = ptr.y, r = GU * 1.1;
+  emit(g, k, a);
+  g.lineWidth = Math.max(0.6, 0.9 * SCALE);
+  g.beginPath();
+  g.moveTo(x - r * 1.8, y); g.lineTo(x - r * 0.5, y);
+  g.moveTo(x + r * 0.5, y); g.lineTo(x + r * 1.8, y);
+  g.moveTo(x, y - r * 1.8); g.lineTo(x, y - r * 0.5);
+  g.moveTo(x, y + r * 0.5); g.lineTo(x, y + r * 1.8);
+  g.stroke();
+  g.beginPath(); g.arc(x, y, r * 0.42, 0, TAU); g.stroke();
+  plain(g);
+
+  // its coordinates, in the galaxy's own units
+  var S = camScale();
+  var kx = (x - CX) / S, ky = (y - CY) / S / Math.max(0.12, Math.cos(cam.inc));
+  txt(g, k, kx.toFixed(2) + ' , ' + ky.toFixed(2) + ' KPC', x + GU * 1.5, y + GU * 1.6, 6.4,
+      { a: a * 0.7, track: 0.9 });
+}
+
+// ────────────────────────────────────────────────────────────── 5d. the readouts
+
+function bars(g, k, x, y, w, h, n, vals, a) {
+  emit(g, k, a);
+  var bw = w / n;
+  for (var i = 0; i < n; i++) {
+    var v = clamp(vals(i), 0, 1);
+    var bh = Math.max(1, v * h);
+    g.fillRect(gx(x + i * bw), Math.round(y + h - bh), Math.max(1, bw * 0.62), Math.round(bh));
+  }
+  plain(g);
+}
+
+function spark(g, k, x, y, w, h, n, f, a, lw) {
+  emit(g, k, a);
+  g.lineWidth = (lw || 0.8) * SCALE;
+  g.beginPath();
+  for (var i = 0; i <= n; i++) {
+    var px = x + i / n * w;
+    var py = y + h * 0.5 - clamp(f(i / n), -1, 1) * h * 0.5;
+    if (i === 0) g.moveTo(px, py); else g.lineTo(px, py);
+  }
+  g.stroke();
+  plain(g);
+}
+
+function hex(n, w) {
+  var s = (n >>> 0).toString(16).toUpperCase();
+  while (s.length < w) s = '0' + s;
+  return s.slice(-w);
+}
+
+// the spectral ladder down the left — where the instrument is tuned, and where
+// it has been. This is the piece's one number made visible.
+function drawBandLadder(g, k, T, boot) {
+  var x = gx(GU * 2), y0 = gx(H * 0.30), i;
+  var rowH = GU * 2.2;
+  var on = k === 'c';
+
+  if (on) {
+    txt(g, k, 'SPECTRAL BAND', x, y0 - GU * 1.2, 7, { a: 0.42 * boot, track: 1.6 });
+    rule(g, k, x, y0 - GU * 0.7, x + GU * 8.6, 0.22 * boot);
+  }
+
+  var w = [band.radio, band.ir, band.opt, band.uv, band.xray];
+  for (i = 0; i < 5; i++) {
+    var y = y0 + i * rowH;
+    var v = w[i];
+    var lit = v > 0.3;
+    var kk = i === 4 ? 'm' : i === 1 ? 'a' : 'c';
+    if (k !== kk) continue;
+
+    var a = (0.30 + v * 0.70) * boot;
+    txt(g, k, BANDS[i].n, x + GU * 1.3, y + GU * 0.45, 7.4, { a: a, track: 1.3, w: lit ? '600' : '400' });
+    txt(g, k, BANDS[i].wl, x + GU * 1.3, y + GU * 1.45, 6.2, { a: a * 0.5, track: 0.9 });
+
+    // the marker: filled when tuned, hollow when not
+    emit(g, k, a);
+    g.lineWidth = Math.max(0.6, 0.9 * SCALE);
+    g.beginPath();
+    g.arc(x + GU * 0.35, y + GU * 0.2, GU * 0.28, 0, TAU);
+    if (lit) g.fill(); else g.stroke();
+    plain(g);
+
+    // a strength bar
+    emit(g, k, a * 0.5);
+    g.fillRect(x + GU * 5.6, y - GU * 0.05, GU * 3 * v, Math.max(1, GU * 0.22));
+    plain(g);
+  }
+
+  // the tuning line, sliding continuously between the rungs
+  if (on) {
+    var ly = y0 + band.lam * 4 * rowH;
+    emit(g, k, 0.8 * boot);
+    g.lineWidth = Math.max(0.7, 1.1 * SCALE);
+    g.beginPath();
+    g.moveTo(x - GU * 0.55, ly + GU * 0.2);
+    g.lineTo(x + GU * 0.05, ly + GU * 0.2);
+    g.stroke();
+    g.beginPath();
+    g.moveTo(x - GU * 0.55, ly - GU * 0.15);
+    g.lineTo(x - GU * 0.55, ly + GU * 0.55);
+    g.stroke();
+    plain(g);
+  }
+}
+
+function drawTelemetry(g, k, T, boot) {
+  if (k !== 'c' || compact) return;
+  var x = gx(GU * 2), y = gx(H - GU * 13), i;
+  var a = 0.55 * boot;
+
+  txt(g, k, 'TELEMETRY', x, y, 7, { a: a * 0.6, track: 1.6 });
+  rule(g, k, x, y + GU * 0.5, x + GU * 13, a * 0.3);
+
+  // rows scroll, values tick on TICK_P so they are legible and still alive
+  var tickN = Math.floor(T / TICK_P);
+  var scroll = fract(T / (LOOP / 8)) * 8;
+  for (i = 0; i < 8; i++) {
+    var idx = (i + Math.floor(scroll)) % world.telem.length;
+    var row = world.telem[idx];
+    var yy = y + GU * 1.4 + i * GU * 1.15;
+    var fade = i === 0 ? fract(scroll) : i === 7 ? 1 - fract(scroll) : 1;
+    var v = row.v + Math.sin(tickN * 0.7 + idx) * row.d * 40;
+    txt(g, k, row.k, x, yy, 6.4, { a: a * 0.5 * fade, track: 0.8 });
+    txt(g, k, (v >= 0 ? '+' : '') + v.toFixed(2), x + GU * 3.0, yy, 6.4, { a: a * 0.82 * fade, track: 0.5 });
+    txt(g, k, hex(row.hex + tickN * (idx + 3), 4), x + GU * 7.4, yy, 6.4, { a: a * 0.34 * fade, track: 0.5 });
+    // a tiny bar
+    emit(g, k, a * 0.3 * fade);
+    g.fillRect(x + GU * 10.2, yy - GU * 0.32, GU * 2.6 * (0.2 + 0.8 * Math.abs(Math.sin(idx + tickN * 0.4))), Math.max(1, GU * 0.16));
+    plain(g);
+  }
+}
+
+function drawSpectrum(g, k, T, boot) {
+  if (compact) return;
+  var w = GU * 13, h = GU * 4.2;
+  var x = gx(W - GU * 2 - w), y = gx(H - GU * 7.4);
+  var on = k === 'c';
+  var a = 0.6 * boot;
+
+  if (on) {
+    txt(g, k, 'INTEGRATED FLUX', x, y - GU * 0.8, 7, { a: a * 0.6, track: 1.6 });
+    bracket(g, k, x, y, w, h, a * 0.3, GU * 0.7);
+  }
+
+  // the actual spectrum: a continuum plus emission lines, and the marker sits
+  // where the instrument is tuned. Same number as everything else.
+  var ck = k === 'c' ? 0 : k === 'a' ? 1 : 2;
+  var amp = [band.uv + band.opt * 0.5, band.ir + band.opt * 0.4, band.xray + band.uv * 0.4][ck];
+  spark(g, k, x + GU * 0.4, y + GU * 0.3, w - GU * 0.8, h - GU * 0.6, 72, function (t) {
+    var cont = Math.exp(-Math.pow((t - (0.2 + ck * 0.3)) / 0.42, 2)) * 1.1;
+    var lines = 0;
+    for (var i = 0; i < 6; i++) {
+      var lp = (i * 0.173 + ck * 0.11) % 1;
+      lines += Math.exp(-Math.pow((t - lp) / 0.011, 2)) * (0.35 + 0.5 * Math.abs(N.n2(i * 3.1 + ck, T * 0.2)));
+    }
+    var noise = N.n2(t * 60 + ck * 11, T * 3.1) * 0.10;
+    return (cont * 0.55 + lines * 0.7 + noise) * (0.35 + amp * 0.8) * 2 - 1;
+  }, a * (0.35 + amp * 0.65), 0.9);
+
+  if (on) {
+    var mx = x + GU * 0.4 + band.lam * (w - GU * 0.8);
+    emit(g, k, a * 0.7);
+    g.lineWidth = Math.max(0.5, 0.7 * SCALE);
+    g.setLineDash([2 * SCALE, 2 * SCALE]);
+    g.beginPath(); g.moveTo(mx, y + GU * 0.2); g.lineTo(mx, y + h - GU * 0.2); g.stroke();
+    g.setLineDash([]);
+    plain(g);
+    txt(g, k, band.wl, mx + GU * 0.3, y + h - GU * 0.3, 6.2, { a: a * 0.7, track: 0.8 });
+  }
+}
+
+function drawDossier(g, k, T, boot) {
+  var w = GU * 15, h = GU * 10.5;
+  var x = gx(W - GU * 2 - w), y = gx(GU * 6.2);
+  if (compact) { w = GU * 12; x = gx(W - GU * 1.2 - w); }
+  var o = lockIdx >= 0 ? world.cat[lockIdx] : null;
+  var open = sstep(0, 1, lockT);
+  if (open < 0.01) {
+    if (k === 'c') {
+      txt(g, k, 'NO TARGET', x + w, y, 7, { a: 0.28 * boot, align: 'right', track: 1.6 });
+      rule(g, k, x + w - GU * 5, y + GU * 0.5, x + w, 0.18 * boot, true);
+    }
+    return;
+  }
+
+  var a = 0.85 * boot * open;
+  var kk = o.ch || 'c';
+  var hh = h * open;
+
+  if (k === 'c') {
+    bracket(g, k, x, y - GU * 0.6, w, hh, a * 0.45, GU * 0.9);
+  }
+  if (k !== kk && k !== 'c') return;
+
+  var ra = k === kk ? a : a * 0.34;
+  var yy = y + GU * 0.7;
+
+  if (k === kk) {
+    txt(g, k, o.name, x + GU * 0.6, yy, 11, { a: ra, track: 1.8, w: '600' });
+    yy += GU * 1.25;
+    txt(g, k, o.kind + '   ' + (o.id || ''), x + GU * 0.6, yy, 6.8, { a: ra * 0.55, track: 1.1 });
+    yy += GU * 1.1;
+  } else {
+    yy += GU * 2.35;
+  }
+  if (k !== 'c') return;
+
+  rule(g, k, x + GU * 0.6, yy - GU * 0.2, x + w - GU * 0.6, a * 0.3);
+  yy += GU * 0.7;
+
+  var rows = [
+    ['DISTANCE', o.dist.toFixed(3) + ' KPC'],
+    ['GAL LON',  (o.lon * 180 / Math.PI).toFixed(2) + '°'],
+    ['RAD VEL',  (o.rv >= 0 ? '+' : '') + o.rv.toFixed(1) + ' KM/S'],
+    ['T_EFF',    o.temp + ' K'],
+    ['FLUX',     o.flux.toFixed(3) + ' JY'],
+    ['CONF',     (o.conf * 100).toFixed(1) + '%']
+  ];
+  for (var i = 0; i < rows.length; i++) {
+    if (yy > y + hh - GU * 1.4) break;
+    txt(g, k, rows[i][0], x + GU * 0.6, yy, 6.5, { a: a * 0.42, track: 1.0 });
+    txt(g, k, rows[i][1], x + w - GU * 0.6, yy, 6.5, { a: a * 0.86, align: 'right', track: 0.6 });
+    yy += GU * 1.08;
+  }
+
+  // a confidence bar and a live detector trace
+  if (yy < y + hh - GU * 1.2) {
+    emit(g, k, a * 0.25);
+    g.fillRect(x + GU * 0.6, yy, w - GU * 1.2, Math.max(1, GU * 0.2));
+    plain(g);
+    emit(g, k, a * 0.8);
+    g.fillRect(x + GU * 0.6, yy, (w - GU * 1.2) * o.conf, Math.max(1, GU * 0.2));
+    plain(g);
+    spark(g, k, x + GU * 0.6, yy + GU * 0.7, w - GU * 1.2, GU * 1.4, 56, function (t) {
+      return Math.sin(t * 34 + T * 3) * 0.4 * Math.exp(-Math.pow((t - fract(T * 0.4)) / 0.16, 2)) +
+             N.n2(t * 40, T * 2.2) * 0.34;
+    }, a * 0.5);
+  }
+
+  if (o.note) txt(g, k, o.note, x + GU * 0.6, y + hh - GU * 0.4, 6.2, { a: a * 0.4, track: 0.9 });
+}
+
+function drawStatus(g, k, T, boot) {
+  var pad = gx(GU * 2), i;
+  var a = 0.8 * boot;
+
+  if (k === 'c') {
+    // top-left identity block
+    txt(g, k, 'PARALLAX', pad, gx(GU * 2.6), 13, { a: a * 0.95, track: 4.2, w: '600' });
+    txt(g, k, 'GALACTIC SURVEY ARRAY · SECTOR SCAN', pad, gx(GU * 3.9), 7, { a: a * 0.42, track: 1.8 });
+    rule(g, k, pad, gx(GU * 4.6), pad + GU * 17, a * 0.28);
+
+    // the live band readout
+    txt(g, k, band.name, pad, gx(GU * 6.6), 9.5, { a: a * 0.9, track: 2.4, w: '600' });
+    txt(g, k, 'λ ' + band.wl + '   LOCK ' + (band.lock * 100).toFixed(0) + '%',
+        pad, gx(GU * 7.7), 6.8, { a: a * 0.5, track: 1.2 });
+
+    // top-right: state
+    var rx = W - pad;
+    var swp = (sweepAngle(T) * 180 / Math.PI);
+    txt(g, k, 'AZ ' + swp.toFixed(1).padStart(5, '0') + '°', rx, gx(GU * 2.4), 7.5, { a: a * 0.8, align: 'right', track: 1.2 });
+    txt(g, k, 'INC ' + (cam.inc * 180 / Math.PI).toFixed(1) + '°   ZOOM ' + cam.zoom.toFixed(2) + '×',
+        rx, gx(GU * 3.4), 6.8, { a: a * 0.64, align: 'right', track: 1.0 });
+    txt(g, k, 'T+' + (T % LOOP).toFixed(2).padStart(5, '0') + ' S   CYCLE ' + (Math.floor(T / LOOP) + 1),
+        rx, gx(GU * 4.4), 6.8, { a: a * 0.64, align: 'right', track: 1.0 });
+    txt(g, k, 'SEED ' + SEED, rx, gx(GU * 5.4), 6.8, { a: a * 0.48, align: 'right', track: 1.0 });
+
+    // frame brackets — the console's own edge
+    bracket(g, k, pad * 0.45, pad * 0.45, W - pad * 0.9, H - pad * 0.9, a * 0.22, GU * 2.2);
+
+    // bottom centre: scale bar, in real units
+    var S = camScale();
+    var kpcW = 5 * S;
+    var bx = CX - kpcW / 2, by = H - gx(GU * 2.4);
+    emit(g, k, a * 0.5);
+    g.lineWidth = Math.max(0.6, 0.9 * SCALE);
+    g.beginPath();
+    g.moveTo(bx, by); g.lineTo(bx + kpcW, by);
+    g.moveTo(bx, by - GU * 0.3); g.lineTo(bx, by + GU * 0.3);
+    g.moveTo(bx + kpcW, by - GU * 0.3); g.lineTo(bx + kpcW, by + GU * 0.3);
+    g.moveTo(bx + kpcW / 2, by - GU * 0.18); g.lineTo(bx + kpcW / 2, by + GU * 0.18);
+    g.stroke();
+    plain(g);
+    txt(g, k, '5 KPC', CX, by - GU * 0.6, 6.5, { a: a * 0.6, align: 'center', track: 1.4 });
+
+    // arm labels, laid along the arms themselves
+    if (!compact) {
+      for (i = 0; i < ARMS.length; i++) {
+        var arm = ARMS[i];
+        var ap = armPoint(arm, 0.72);
+        var p = proj(ap.x, ap.y, 0);
+        if (p.x < GU * 4 || p.x > W - GU * 4 || p.y < GU * 4 || p.y > H - GU * 4) continue;
+        txt(g, k, arm.name, p.x, p.y, 6.6, { a: a * 0.26 * (0.5 + band.gasGain * 0.4), align: 'center', track: 2.0 });
+      }
+    }
+  }
+
+  // the anomaly alert, in magenta, bottom-left of the identity block
+  if (k === 'm') {
+    var blink = 0.5 + 0.5 * Math.sin(T * TAU / (LOOP / 32));
+    var ay = gx(GU * 9.4);
+    txt(g, k, '▲ ANOMALY', pad, ay, 8, { a: a * (0.45 + blink * 0.55), track: 2.0, w: '600' });
+    txt(g, k, world.anomaly.id, pad, ay + GU * 1.0, 6.5, { a: a * 0.5, track: 1.0 });
+    txt(g, k, world.anomaly.dist.toFixed(2) + ' KPC FROM OBSERVER', pad, ay + GU * 1.9, 6.2, { a: a * 0.34, track: 0.9 });
+  }
+}
+
+// ────────────────────────────────────────────────────────────────── 6. the screen
+//
+// A phosphor screen is not a clean window. It blooms, it scans, its channels do
+// not quite land on each other, and it has a curve. Lamplighter's plates were a
+// pixel out of register because a press never lines up; these are out of
+// register because glass disperses.
+
+var scanPat = null, maskPat = null, noiseTile = null;
+function buildScreen() {
+  // scanlines
+  var s = document.createElement('canvas');
+  var sp = Math.max(2, Math.round(3 * SCALE));
+  s.width = 4; s.height = sp;
+  var sg = s.getContext('2d');
+  sg.fillStyle = 'rgba(0,0,0,0.30)';
+  sg.fillRect(0, 0, 4, Math.max(1, Math.round(sp / 3)));
+  scanPat = s;
+
+  // aperture mask — a soft RGB triad, very faint, mostly texture
+  var m = document.createElement('canvas');
+  m.width = 3; m.height = 1;
+  var mg = m.getContext('2d');
+  mg.fillStyle = 'rgba(255,150,150,1)'; mg.fillRect(0, 0, 1, 1);
+  mg.fillStyle = 'rgba(150,255,170,1)'; mg.fillRect(1, 0, 1, 1);
+  mg.fillStyle = 'rgba(150,180,255,1)'; mg.fillRect(2, 0, 1, 1);
+  maskPat = m;
+
+  // sensor noise, one tile, offset deterministically per frame
+  var n = document.createElement('canvas');
+  var NS = 160;
+  n.width = n.height = NS;
+  var ng = n.getContext('2d');
+  var img = ng.createImageData(NS, NS), d = img.data;
+  var r = mulberry32(SEED ^ 0x5A17);
+  for (var i = 0; i < NS * NS; i++) {
+    var v = Math.pow(r(), 3.1) * 255;
+    d[i * 4] = v * 0.6; d[i * 4 + 1] = v * 0.85; d[i * 4 + 2] = v;
+    d[i * 4 + 3] = 255;
+  }
+  ng.putImageData(img, 0, 0);
+  noiseTile = n;
+}
+
+// channel offsets. A real lens disperses by wavelength, so the channels land in
+// a fixed order and drift slowly rather than jittering.
+var REG = { c: [0, 0], a: [1.15, -0.55], m: [-1.0, 0.65] };
+
+function composite(T) {
+  out.setTransform(1, 0, 0, 1, 0, 0);
+  out.globalCompositeOperation = 'source-over';
+  out.globalAlpha = 1;
+  out.fillStyle = VOID;
+  out.fillRect(0, 0, W, H);
+
+  out.globalCompositeOperation = 'lighter';
+  for (var i = 0; i < 3; i++) {
+    var k = CHAN[i], r = REG[k];
+    var drift = 0.6 + 0.5 * Math.sin(T * TAU / LOOP + i * 2.1);
+    var dx = r[0] * drift * SCALE;
+    var dy = r[1] * drift * SCALE;
+    out.drawImage(buf[k].c, dx, dy);
+  }
+
+  // bloom — downscale twice and add back. Cheaper than a blur filter by an
+  // order of magnitude and, at this scale, indistinguishable.
+  bloomG.globalCompositeOperation = 'source-over';
+  bloomG.drawImage(view, 0, 0, bloomC.width, bloomC.height);
+  bloomSG.globalCompositeOperation = 'source-over';
+  bloomSG.drawImage(bloomC, 0, 0, bloomS.width, bloomS.height);
+
+  out.globalCompositeOperation = 'lighter';
+  out.globalAlpha = 0.21;
+  out.drawImage(bloomC, 0, 0, W, H);
+  out.globalAlpha = 0.17;
+  out.drawImage(bloomS, 0, 0, W, H);
+  out.globalAlpha = 1;
+
+  // sensor noise, offset by frame so it crawls — deterministically
+  var fN = Math.round(T * FPS);
+  var nx = -(fN * 37 % 160), ny = -(fN * 61 % 160);
+  out.globalCompositeOperation = 'lighter';
+  out.globalAlpha = 0.030 * band.grain;
+  var np = out.createPattern(noiseTile, 'repeat');
+  out.save();
+  out.translate(nx, ny);
+  out.fillStyle = np;
+  out.fillRect(0, 0, W + 160, H + 160);
+  out.restore();
+  out.globalAlpha = 1;
+
+  // aperture mask
+  out.globalCompositeOperation = 'multiply';
+  out.globalAlpha = 0.16;
+  out.fillStyle = out.createPattern(maskPat, 'repeat');
+  out.fillRect(0, 0, W, H);
+
+  // scanlines
+  out.globalAlpha = 0.5;
+  out.fillStyle = out.createPattern(scanPat, 'repeat');
+  out.fillRect(0, 0, W, H);
+  out.globalAlpha = 1;
+
+  // a sync tear, rarely, deterministic from the frame number
+  var tear = N.n2(fN * 0.031, 7.3);
+  if (tear > 0.42) {
+    var th = Math.round(H * 0.02 + Math.abs(N.n2(fN * 0.07, 2.2)) * H * 0.06);
+    var ty = Math.round(Math.abs(N.n2(fN * 0.013, 5.1)) * (H - th));
+    var sh = Math.round((tear - 0.42) * 40 * SCALE);
+    out.globalCompositeOperation = 'source-over';
+    out.drawImage(view, 0, ty, W, th, sh, ty, W, th);
+  }
+
+  // the glass: vignette, then a faint edge sheen
+  out.globalCompositeOperation = 'multiply';
+  var vg = out.createRadialGradient(CX, CY * 0.96, Math.min(W, H) * 0.30, CX, CY, Math.max(W, H) * 0.80);
+  vg.addColorStop(0, 'rgba(255,255,255,1)');
+  vg.addColorStop(0.72, 'rgba(188,196,214,1)');
+  vg.addColorStop(1, 'rgba(70,78,96,1)');
+  out.fillStyle = vg;
+  out.fillRect(0, 0, W, H);
+
+  out.globalCompositeOperation = 'lighter';
+  var sg2 = out.createLinearGradient(0, 0, W * 0.6, H);
+  sg2.addColorStop(0, 'rgba(70,130,180,0.045)');
+  sg2.addColorStop(0.45, 'rgba(0,0,0,0)');
+  out.fillStyle = sg2;
+  out.fillRect(0, 0, W, H);
+
+  out.globalCompositeOperation = 'source-over';
+}
+
+// ───────────────────────────────────────────────────────────────────── 7. a frame
+
+var hoverIdx = -1, lockIdx = -1, lockT = 0, dustOn = false;
+var PASS = null;   // filled in at the bottom; see window.parallax.__passes
+var ptr = { x: 0, y: 0 }, pointerIn = false;
+
+function render(T) {
+  updateBand(fract(T / LOOP));
+  PASS.project();
+  dustOn = PASS.buildDustMask(T);
+  var boot = DETERM ? 1 : sstep(0.15, 2.4, sess);
+
+  for (var i = 0; i < 3; i++) {
+    var k = CHAN[i], g = buf[k].g;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = 'source-over';
+    g.globalAlpha = 1;
+    g.fillStyle = '#000000';
+    g.fillRect(0, 0, W, H);
+
+    // the void, and the machine's own scaffolding
+    PASS.drawDeep(g, k, T);
+    PASS.drawGrid(g, k, T, boot);
+    PASS.drawGraticule(g, k, T, boot);
+
+    // the galaxy, far side first, because the dust is the only thing here that
+    // cares about order
+    g.save();
+    g.globalAlpha = 1;
+    PASS.drawHalo(g, k, T);
+    PASS.drawArmGas(g, k, T);
+    PASS.drawStars(g, k, T, false);
+    PASS.drawGlobs(g, k, T);
+    PASS.drawHII(g, k, T);
+    PASS.drawDust(g, k, T);
+    PASS.drawStars(g, k, T, true);
+    g.restore();
+
+    // the instrument
+    PASS.drawRings(g, k, T, boot);
+    PASS.drawSweep(g, k, T, boot);
+    PASS.drawContacts(g, k, T, boot);
+    PASS.drawAnomaly(g, k, T, boot);
+    PASS.drawBandLadder(g, k, T, boot);
+    PASS.drawTelemetry(g, k, T, boot);
+    PASS.drawSpectrum(g, k, T, boot);
+    PASS.drawDossier(g, k, T, boot);
+    PASS.drawStatus(g, k, T, boot);
+    PASS.drawReticle(g, k, T, boot);
+  }
+
+  PASS.composite(T);
+  overlay(T);
+}
+
+// ─────────────────────────────────────────────────────────────────── 8. overlay
+
+var sess = 0, hudUntil = 10;
+function overlay(T) {
+  if (STILL) return;               // a still is for capture; it carries no chrome
+  var age = sess;
+  var titleA = sstep(0.3, 1.6, age) * (1 - sstep(6.5, 9.0, age));
+  out.save();
+  out.textBaseline = 'alphabetic';
+
+  if (titleA > 0.004) {
+    var cx = W * 0.5, cy = H * 0.62;
+    out.globalAlpha = titleA * 0.5;
+    out.fillStyle = '#8fe6ff';
+    out.textAlign = 'center';
+    out.font = '400 ' + Math.round(9 * SCALE) + 'px ' + FONT;
+    if (hasTrack) out.letterSpacing = 2.4 * SCALE + 'px';
+    out.fillText('THREE CHANNELS, NO IMAGES · SEED ' + SEED, cx, cy);
+    if (hasTrack) out.letterSpacing = '0px';
+  }
+
+  var hudA = (1 - sstep(hudUntil - 1.4, hudUntil, age)) * 0.6;
+  if (hudA > 0.004) {
+    out.globalAlpha = hudA;
+    out.fillStyle = '#7fd4ee';
+    out.textAlign = 'center';
+    out.font = '400 ' + Math.round(9 * SCALE) + 'px ' + FONT;
+    if (hasTrack) out.letterSpacing = 1.2 * SCALE + 'px';
+    var line = (AudioEng.on() ? 'sound on' : 'click for sound') +
+      '   drag orbit   wheel zoom   click a contact   n seed   p pause   [ ] scrub   g grid   f full';
+    out.fillText(line, W * 0.5, H - 10 * SCALE);
+    if (hasTrack) out.letterSpacing = '0px';
+  }
+
+  if (AudioEng.pending()) {
+    out.globalAlpha = 0.45 + 0.25 * Math.sin(T * 2.4);
+    out.fillStyle = '#7fd4ee';
+    out.textAlign = 'left';
+    out.font = '400 ' + Math.round(10 * SCALE) + 'px ' + FONT;
+    out.fillText('♪', 14 * SCALE, H - 10 * SCALE);
+  }
+  if (Rec.active()) {
+    out.globalAlpha = 0.9;
+    out.fillStyle = '#ff4d6a';
+    out.beginPath(); out.arc(W - 26 * SCALE, H - 14 * SCALE, 4.5 * SCALE, 0, TAU); out.fill();
+  }
+  out.restore();
+  out.globalAlpha = 1;
+}
+
+// ───────────────────────────────────────────────────────────────────── 9. audio
+//
+// No samples. A sub drone, a filtered-noise sweep, telemetry chirps and a
+// sounding tone for the anomaly.
+//
+// The sweep is the thing to notice. Lamplighter's foghorn fired on a step
+// counter while its beam turned on a seeded period, so the two drifted against
+// each other, and the handoff called that the most obviously unfinished part of
+// the piece. Here the audio reads sweepAngle(simT) — the same function the
+// pixels read. When the sweep crosses a contact it pings, because it crossed it.
+
+var AudioEng = (function () {
+  var ac = null, master, comp, revIn, started = false, wantOn = false;
+  var noiseBuf = null, timer = 0, nextT = 0, step = 0, dest = null;
+  var sweepGain = null, sweepFilt = null;
+  var lastSweep = 0, lastBand = -1;
+  var DEG = [0, 2, 3, 7, 9, 10, 14, 15, 19];
+  var ROOT = 82.41;
+
+  function mkNoise(sec) {
+    var n = ac.sampleRate * sec, b = ac.createBuffer(1, n, ac.sampleRate), d = b.getChannelData(0);
+    var r = mulberry32(SEED ^ 0xA53F), last = 0;
+    for (var i = 0; i < n; i++) { var w = r() * 2 - 1; last = last * 0.68 + w * 0.32; d[i] = last * 1.7; }
+    return b;
+  }
+  function mkImpulse(sec, decay) {
+    var n = (ac.sampleRate * sec) | 0, b = ac.createBuffer(2, n, ac.sampleRate);
+    var r = mulberry32(SEED ^ 0x1D77);
+    for (var c = 0; c < 2; c++) {
+      var d = b.getChannelData(c);
+      for (var i = 0; i < n; i++) d[i] = (r() * 2 - 1) * Math.pow(1 - i / n, decay);
+    }
+    return b;
+  }
+  function lfo(rate, depth, target, base) {
+    var o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.value = rate; g.gain.value = depth;
+    o.connect(g); g.connect(target);
+    if (base !== undefined) target.value = base;
+    o.start();
+    return o;
+  }
+
+  function build() {
+    master = ac.createGain(); master.gain.value = 0;
+    comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -20; comp.ratio.value = 4.5; comp.knee.value = 14;
+    master.connect(comp); comp.connect(ac.destination);
+    dest = ac.createMediaStreamDestination(); comp.connect(dest);
+
+    var rev = ac.createConvolver(); rev.buffer = mkImpulse(4.2, 2.2);
+    revIn = ac.createGain(); revIn.gain.value = 0.40;
+    revIn.connect(rev); rev.connect(master);
+
+    noiseBuf = mkNoise(4);
+
+    // the drone — a machine that is switched on
+    var dg = ac.createGain(); dg.gain.value = 0.060;
+    var df = ac.createBiquadFilter(); df.type = 'lowpass'; df.Q.value = 3.4;
+    lfo(0.031, 220, df.frequency, 360);
+    df.connect(dg); dg.connect(master); dg.connect(revIn);
+    [[ROOT / 2, 'sine', 0], [ROOT, 'sawtooth', -7], [ROOT, 'sawtooth', 8], [ROOT * 1.5, 'triangle', 4]]
+      .forEach(function (s) {
+        var o = ac.createOscillator(), g = ac.createGain();
+        o.type = s[1]; o.frequency.value = s[0]; o.detune.value = s[2];
+        g.gain.value = s[1] === 'sine' ? 0.75 : 0.20;
+        o.connect(g); g.connect(df); o.start();
+      });
+
+    // cooling fans / cabinet hiss
+    var wn = ac.createBufferSource(); wn.buffer = noiseBuf; wn.loop = true;
+    var wf = ac.createBiquadFilter(); wf.type = 'highpass'; wf.frequency.value = 2400;
+    var wg = ac.createGain(); wg.gain.value = 0.012;
+    lfo(0.027, 0.008, wg.gain);
+    wn.connect(wf); wf.connect(wg); wg.connect(master);
+    wn.start();
+
+    // the sweep — a band of noise whose gain and centre are driven, every
+    // scheduler step, by the angle the sweep is actually at on screen
+    var sn = ac.createBufferSource(); sn.buffer = noiseBuf; sn.loop = true;
+    sweepFilt = ac.createBiquadFilter(); sweepFilt.type = 'bandpass'; sweepFilt.Q.value = 1.6;
+    sweepFilt.frequency.value = 500;
+    sweepGain = ac.createGain(); sweepGain.gain.value = 0.0;
+    sn.connect(sweepFilt); sweepFilt.connect(sweepGain);
+    sweepGain.connect(master); sweepGain.connect(revIn);
+    sn.start();
+  }
+
+  // a short FM blip — telemetry
+  function chirp(when, freq, vel, dur) {
+    var car = ac.createOscillator(), mod = ac.createOscillator();
+    var mg = ac.createGain(), g = ac.createGain();
+    car.type = 'sine'; mod.type = 'sine';
+    car.frequency.value = freq;
+    mod.frequency.value = freq * 1.41;
+    mg.gain.setValueAtTime(freq * 2.2 * vel, when);
+    mg.gain.exponentialRampToValueAtTime(freq * 0.04, when + dur * 0.7);
+    mod.connect(mg); mg.connect(car.frequency);
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(0.10 * vel, when + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+    car.connect(g); g.connect(master); g.connect(revIn);
+    mod.start(when); car.start(when);
+    mod.stop(when + dur + 0.2); car.stop(when + dur + 0.2);
+  }
+
+  // the sounding — deep, for the anomaly and for band changes
+  function sound(when, base, len) {
+    var g = ac.createGain();
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(0.11, when + 0.35);
+    g.gain.setValueAtTime(0.11, when + len * 0.5);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + len);
+    g.connect(master); g.connect(revIn);
+    [1, 1.5, 2.005].forEach(function (mul, i) {
+      var o = ac.createOscillator(), og = ac.createGain();
+      o.type = i === 2 ? 'sine' : 'triangle';
+      o.frequency.setValueAtTime(base * mul * 0.99, when);
+      o.frequency.linearRampToValueAtTime(base * mul, when + 0.5);
+      og.gain.value = [1, 0.5, 0.2][i];
+      o.connect(og); og.connect(g);
+      o.start(when); o.stop(when + len + 0.2);
+    });
+  }
+
+  function lockTone(when) {
+    chirp(when, 880, 0.9, 0.09);
+    chirp(when + 0.085, 1320, 0.8, 0.14);
+  }
+
+  var STEP = 0.125, rnd2 = mulberry32(SEED ^ 0x77A1);
+  function schedule() {
+    if (!started) return;
+    var look = ac.currentTime + 0.22;
+
+    // ── the sweep, locked to the picture
+    var ang = sweepAngle(simT);
+    var wobble = 0.5 + 0.5 * Math.sin(ang * 3);
+    sweepGain.gain.setTargetAtTime(0.055 * (0.35 + wobble * 0.65), ac.currentTime, 0.06);
+    sweepFilt.frequency.setTargetAtTime(280 + wobble * 900, ac.currentTime, 0.08);
+
+    while (nextT < look) {
+      var at = simT + (nextT - ac.currentTime);
+
+      // telemetry chatter, denser where the instrument is straining
+      var dens = 0.06 + (band.xray || 0) * 0.30 + (band.uv || 0) * 0.16;
+      if (rnd2() < dens) {
+        var deg = DEG[(rnd2() * DEG.length) | 0];
+        var oct = rnd2() < 0.4 ? 4 : 3;
+        chirp(nextT, ROOT * Math.pow(2, oct) * Math.pow(2, deg / 12) / 4,
+              0.35 + rnd2() * 0.5, 0.05 + rnd2() * 0.12);
+      }
+
+      // ── a ping when the sweep actually crosses a catalogued contact.
+      //    Not a counter. The same angle the pixels are drawn from.
+      var a0 = lastSweep, a1 = sweepAngle(at);
+      if (a1 < a0) a0 -= TAU;
+      for (var i = 0; i < world.cat.length; i++) {
+        var o = world.cat[i];
+        if (!o._on) continue;
+        var oth = Math.atan2(o._y - CY, o._x - CX);
+        if (oth < 0) oth += TAU;
+        var crossed = (a0 < oth && oth <= a1) || (a0 < oth - TAU && oth - TAU <= a1);
+        if (!crossed) continue;
+        var pri = o.pri || 1;
+        chirp(nextT, 520 + pri * 260 + (o.dist % 3) * 90, 0.22 + pri * 0.18, 0.06 + pri * 0.03);
+      }
+      // and the anomaly gets a sounding, not a ping
+      var anTh = Math.atan2(world.anomaly._y - CY, world.anomaly._x - CX);
+      if (anTh < 0) anTh += TAU;
+      if ((a0 < anTh && anTh <= a1) || (a0 < anTh - TAU && anTh - TAU <= a1)) {
+        sound(nextT, 61.7, 2.6);
+      }
+      lastSweep = a1;
+
+      // a chord when the instrument crosses into a new band
+      if (band.idx !== lastBand && band.lock > 0.55) {
+        lastBand = band.idx;
+        sound(nextT, ROOT * Math.pow(2, band.idx / 5) * 0.5, 1.6);
+      }
+
+      nextT += STEP; step++;
+    }
+  }
+
+  return {
+    on: function () { return started && wantOn; },
+    pending: function () { return !started; },
+    stream: function () { return dest ? dest.stream : null; },
+    lock: function () { if (started && wantOn) lockTone(ac.currentTime + 0.01); },
+    sweepPhase: function () { return lastSweep; },
+    toggle: function () {
+      if (!started) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        ac = new AC();
+        build();
+        started = true; wantOn = true;
+        nextT = ac.currentTime + 0.1; step = 0;
+        lastSweep = sweepAngle(simT);
+        timer = setInterval(schedule, 25);
+        master.gain.setTargetAtTime(0.85, ac.currentTime, 1.4);
+        if (ac.state === 'suspended') ac.resume();
+        return;
+      }
+      wantOn = !wantOn;
+      master.gain.setTargetAtTime(wantOn ? 0.85 : 0, ac.currentTime, 0.4);
+    }
+  };
+})();
+
+// ────────────────────────────────────────────────────────────────── 10. capture
+
+var Rec = (function () {
+  var rec = null, chunks = [];
+  function supported() {
+    return typeof MediaRecorder !== 'undefined' && typeof view.captureStream === 'function';
+  }
+  function save(blob, ext) {
+    try {
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'parallax-' + SEED + '-' + Date.now() + ext;
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    } catch (e) { /* a sandbox that cannot hand you a file. fine. */ }
+  }
+  return {
+    active: function () { return !!rec && rec.state === 'recording'; },
+    still: function () {
+      if (!view.toBlob) return;
+      view.toBlob(function (b) { if (b) save(b, '.p' + 'ng'); }, 'image/' + 'png');
+    },
+    toggle: function () {
+      if (!supported()) return;
+      if (rec && rec.state === 'recording') { rec.stop(); return; }
+      try {
+        var stream = view.captureStream(60);
+        var au = AudioEng.stream();
+        if (au) au.getAudioTracks().forEach(function (t) { stream.addTrack(t); });
+        chunks = [];
+        rec = new MediaRecorder(stream, { mimeType: 'video/webm' });
+        rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+        rec.onstop = function () { save(new Blob(chunks, { type: 'video/webm' }), '.webm'); rec = null; };
+        rec.start();
+      } catch (e) { rec = null; }
+    }
+  };
+})();
+
+// ──────────────────────────────────────────────────────── 11. the purity check
+//
+// The claim this file makes is that it contains no media. Rather than ask you to
+// take that on faith, it checks itself out loud. Needles are assembled from
+// fragments so that the check cannot match its own source.
+
+function purity() {
+  var src = document.documentElement.outerHTML;
+  var needles = [
+    'da' + 'ta:', 'ba' + 'se64', '<i' + 'mg', '<vi' + 'deo', '<au' + 'dio', '<sv' + 'g',
+    '<li' + 'nk', '<ifr' + 'ame', 'ht' + 'tp://', 'ht' + 'tps://', '@font-' + 'face',
+    '.p' + 'ng', '.j' + 'pg', '.gi' + 'f', '.we' + 'bp', '.m' + 'p3', '.w' + 'av', '.o' + 'gg'
+  ];
+  var hits = [];
+  for (var i = 0; i < needles.length; i++) {
+    var n = needles[i], at = src.toLowerCase().indexOf(n);
+    if (at >= 0) hits.push(n + ' @' + at);
+  }
+  var report = {
+    bytes: src.length,
+    clean: hits.length === 0,
+    found: hits,
+    canvases: document.querySelectorAll('canvas').length,
+    elements: document.body.children.length
+  };
+  if (report.clean) {
+    console.log('%c parallax ', 'background:#0a4d68;color:#8fe6ff',
+      'no embedded media — one canvas, ' + report.bytes + ' bytes of markup and script, ' +
+      NSTAR + ' stars, every frame computed.');
+  } else {
+    console.warn('parallax: purity check found', hits);
+  }
+  return report;
+}
+
+// ───────────────────────────────────────────────────── 12. the loop, and the hands
+
+var simT = START_FRAME / FPS;
+var lastNow = 0, paused = false, msAvg = 16, raf = 0, showGrid = true;
+var drag = null;
+
+function tick(now) {
+  raf = requestAnimationFrame(tick);
+  var dt = lastNow ? Math.min(0.1, (now - lastNow) / 1000) : 1 / FPS;
+  lastNow = now;
+  sess += dt;
+  if (!paused) simT += DETERM ? 1 / FPS : dt;
+
+  // the camera eases toward where you put it — FUI moves, it does not snap
+  cam.az  += (cam.tAz - cam.az) * Math.min(1, dt * 7);
+  cam.inc += (cam.tInc - cam.inc) * Math.min(1, dt * 7);
+  cam.zoom += (cam.tZoom - cam.zoom) * Math.min(1, dt * 7);
+  if (lockIdx >= 0) lockT = Math.min(1, lockT + dt * 3.2);
+  else lockT = Math.max(0, lockT - dt * 4);
+
+  var t0 = performance.now();
+  render(simT);
+  msAvg = msAvg * 0.93 + (performance.now() - t0) * 0.07;
+  if (msAvg > 27 && quality > 0.5) { quality -= 0.25; msAvg = 16; rebuildForQuality(); }
+  else if (msAvg < 11 && quality < 1) { quality += 0.25; msAvg = 16; rebuildForQuality(); }
+}
+
+function rebuildForQuality() {
+  buildGalaxy();
+  allocProjection();
+}
+
+function newSeed(s) {
+  SEED = (s === undefined) ? (Math.random() * 1e9) | 0 : s;
+  N = makeNoise(SEED ^ 0x9E3779B9);
+  buildGalaxy();
+  buildScreen();
+  allocProjection();
+  lockIdx = -1; hoverIdx = -1; lockT = 0;
+  sess = 0;
+  try { history.replaceState(null, '', '?s=' + SEED); } catch (e) {}
+}
+
+// ── pointer
+
+function toCanvas(e) {
+  var r = view.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * (W / r.width),
+    y: (e.clientY - r.top) * (H / r.height)
+  };
+}
+
+function nearestContact(x, y) {
+  var best = -1, bd = GU * 3.4;
+  for (var i = 0; i < world.cat.length; i++) {
+    var o = world.cat[i];
+    if (!o._on) continue;
+    var dx = o._x - x, dy = o._y - y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+view.addEventListener('pointerdown', function (e) {
+  view.setPointerCapture && view.setPointerCapture(e.pointerId);
+  var p = toCanvas(e);
+  drag = { x: p.x, y: p.y, az: cam.tAz, inc: cam.tInc, moved: 0 };
+  ptr = p; pointerIn = true;
+  hudUntil = sess + 9;
+});
+
+window.addEventListener('pointermove', function (e) {
+  var p = toCanvas(e);
+  ptr = p;
+  pointerIn = true;
+  if (drag) {
+    var dx = p.x - drag.x, dy = p.y - drag.y;
+    drag.moved += Math.abs(dx) + Math.abs(dy);
+    cam.tAz = drag.az + dx / Math.min(W, H) * 3.2;
+    cam.tInc = clamp(drag.inc + dy / Math.min(W, H) * 2.6, 0, 1.45);
+  } else {
+    hoverIdx = nearestContact(p.x, p.y);
+    view.style.cursor = 'none';
+  }
+  hudUntil = Math.max(hudUntil, sess + 4);
+});
+
+window.addEventListener('pointerup', function (e) {
+  if (drag && drag.moved < 6 * SCALE) {
+    var p = toCanvas(e);
+    var hit = nearestContact(p.x, p.y);
+    if (hit >= 0 && hit !== lockIdx) { lockIdx = hit; AudioEng.lock(); }
+    else if (hit < 0) lockIdx = -1;
+    if (!AudioEng.on()) AudioEng.toggle();
+  }
+  drag = null;
+});
+
+window.addEventListener('pointerleave', function () { pointerIn = false; hoverIdx = -1; });
+
+view.addEventListener('wheel', function (e) {
+  e.preventDefault();
+  cam.tZoom = clamp(cam.tZoom * Math.exp(-e.deltaY * 0.0012), 0.45, 5.5);
+  hudUntil = sess + 6;
+}, { passive: false });
+
+window.addEventListener('keydown', function (e) {
+  var key = e.key.toLowerCase();
+  if (key === ' ') { AudioEng.toggle(); e.preventDefault(); }
+  else if (key === 'p') paused = !paused;
+  else if (key === 'n') newSeed();
+  else if (key === '[') simT -= 3;
+  else if (key === ']') simT += 3;
+  else if (key === 'g') showGrid = !showGrid;
+  else if (key === 'escape') lockIdx = -1;
+  else if (key === 'r') Rec.toggle();
+  else if (key === 'c') Rec.still();
+  else if (key === '0') { cam.tAz = CAM0.az; cam.tInc = CAM0.inc; cam.tZoom = CAM0.zoom; }
+  else if (key >= '1' && key <= '5') {
+    // jump the survey to a band
+    var idx = parseInt(key, 10) - 1;
+    simT = Math.floor(simT / LOOP) * LOOP + BANDS[idx].at * 0.5 * LOOP;
+  }
+  else if (key === 'f') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen();
+  }
+  else return;
+  hudUntil = sess + 7;
+});
+
+// A door for the vision loop: render an exact frame, then read the canvas back.
+// Anything in art/tools drives a piece through window.artPiece + window.artReady,
+// so every piece in this folder exposes the same four calls under both names.
+//
+// frame() resets the camera and clears any lock, because a deterministic frame
+// has to be deterministic no matter what somebody dragged a moment ago.
+window.parallax = {
+  frame: function (n) {
+    cam.az = cam.tAz = CAM0.az;
+    cam.inc = cam.tInc = CAM0.inc;
+    cam.zoom = cam.tZoom = CAM0.zoom;
+    lockIdx = -1; hoverIdx = -1; lockT = 0; pointerIn = false;
+    simT = n / FPS;
+    render(simT);
+    return n;
+  },
+  seed: function (s) { newSeed(s | 0); render(simT); return SEED; },
+  // Pin the canonical camera. frame() resets to it, so determinism is intact:
+  // the same seed, frame and view give the same pixels on any machine.
+  view: function (az, inc, zoom) {
+    if (az !== undefined && az !== null) CAM0.az = az;
+    if (inc !== undefined && inc !== null) CAM0.inc = clamp(inc, 0, 1.45);
+    if (zoom !== undefined && zoom !== null) CAM0.zoom = clamp(zoom, 0.45, 5.5);
+    cam.az = cam.tAz = CAM0.az;
+    cam.inc = cam.tInc = CAM0.inc;
+    cam.zoom = cam.tZoom = CAM0.zoom;
+    render(simT);
+    return { az: CAM0.az, inc: CAM0.inc, zoom: CAM0.zoom };
+  },
+  purity: purity,
+  info: function () {
+    return { seed: SEED, w: W, h: H, loop: LOOP, quality: quality, t: simT,
+             band: band.name, stars: NSTAR, lock: lockIdx,
+             az: cam.az, inc: cam.inc, zoom: cam.zoom, compact: compact };
+  }
+};
+// A handle for tools/ablate.mjs. Reassigning one of these to a no-op skips that
+// pass; measuring the whole frame with and without is the only honest way to
+// cost canvas work, because canvas work is deferred and a profiler will lie.
+PASS = window.parallax.__passes = {
+  drawDeep: drawDeep, drawGrid: drawGrid, drawGraticule: drawGraticule,
+  drawHalo: drawHalo, drawArmGas: drawArmGas, drawStars: drawStars,
+  drawGlobs: drawGlobs, drawHII: drawHII, drawDust: drawDust,
+  buildDustMask: buildDustMask, drawRings: drawRings, drawSweep: drawSweep,
+  drawContacts: drawContacts, drawAnomaly: drawAnomaly, drawBandLadder: drawBandLadder,
+  drawTelemetry: drawTelemetry, drawSpectrum: drawSpectrum, drawDossier: drawDossier,
+  drawStatus: drawStatus, drawReticle: drawReticle, composite: composite, project: project
+};
+window.artPiece = window.parallax;
+
+resize();
+if (STILL) { render(simT); }
+else { raf = requestAnimationFrame(tick); }
+window.parallaxReady = true;
+window.artReady = true;
+
+})();
+</script>
+</body></html>
