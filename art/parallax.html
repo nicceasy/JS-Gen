@@ -1686,13 +1686,12 @@ function composite(T) {
 // ───────────────────────────────────────────────────────────────────── 7. a frame
 
 var hoverIdx = -1, lockIdx = -1, lockT = 0, dustOn = false;
-var PASS = null;   // filled in at the bottom; see window.parallax.__passes
 var ptr = { x: 0, y: 0 }, pointerIn = false;
 
 function render(T) {
   updateBand(fract(T / LOOP));
-  PASS.project();
-  dustOn = PASS.buildDustMask(T);
+  project();
+  dustOn = buildDustMask(T);
   var boot = DETERM ? 1 : sstep(0.15, 2.4, sess);
 
   for (var i = 0; i < 3; i++) {
@@ -1704,37 +1703,37 @@ function render(T) {
     g.fillRect(0, 0, W, H);
 
     // the void, and the machine's own scaffolding
-    PASS.drawDeep(g, k, T);
-    PASS.drawGrid(g, k, T, boot);
-    PASS.drawGraticule(g, k, T, boot);
+    drawDeep(g, k, T);
+    drawGrid(g, k, T, boot);
+    drawGraticule(g, k, T, boot);
 
     // the galaxy, far side first, because the dust is the only thing here that
     // cares about order
     g.save();
     g.globalAlpha = 1;
-    PASS.drawHalo(g, k, T);
-    PASS.drawArmGas(g, k, T);
-    PASS.drawStars(g, k, T, false);
-    PASS.drawGlobs(g, k, T);
-    PASS.drawHII(g, k, T);
-    PASS.drawDust(g, k, T);
-    PASS.drawStars(g, k, T, true);
+    drawHalo(g, k, T);
+    drawArmGas(g, k, T);
+    drawStars(g, k, T, false);
+    drawGlobs(g, k, T);
+    drawHII(g, k, T);
+    drawDust(g, k, T);
+    drawStars(g, k, T, true);
     g.restore();
 
     // the instrument
-    PASS.drawRings(g, k, T, boot);
-    PASS.drawSweep(g, k, T, boot);
-    PASS.drawContacts(g, k, T, boot);
-    PASS.drawAnomaly(g, k, T, boot);
-    PASS.drawBandLadder(g, k, T, boot);
-    PASS.drawTelemetry(g, k, T, boot);
-    PASS.drawSpectrum(g, k, T, boot);
-    PASS.drawDossier(g, k, T, boot);
-    PASS.drawStatus(g, k, T, boot);
-    PASS.drawReticle(g, k, T, boot);
+    drawRings(g, k, T, boot);
+    drawSweep(g, k, T, boot);
+    drawContacts(g, k, T, boot);
+    drawAnomaly(g, k, T, boot);
+    drawBandLadder(g, k, T, boot);
+    drawTelemetry(g, k, T, boot);
+    drawSpectrum(g, k, T, boot);
+    drawDossier(g, k, T, boot);
+    drawStatus(g, k, T, boot);
+    drawReticle(g, k, T, boot);
   }
 
-  PASS.composite(T);
+  composite(T);
   overlay(T);
 }
 
@@ -2242,18 +2241,6 @@ window.parallax = {
              band: band.name, stars: NSTAR, lock: lockIdx,
              az: cam.az, inc: cam.inc, zoom: cam.zoom, compact: compact };
   }
-};
-// A handle for tools/ablate.mjs. Reassigning one of these to a no-op skips that
-// pass; measuring the whole frame with and without is the only honest way to
-// cost canvas work, because canvas work is deferred and a profiler will lie.
-PASS = window.parallax.__passes = {
-  drawDeep: drawDeep, drawGrid: drawGrid, drawGraticule: drawGraticule,
-  drawHalo: drawHalo, drawArmGas: drawArmGas, drawStars: drawStars,
-  drawGlobs: drawGlobs, drawHII: drawHII, drawDust: drawDust,
-  buildDustMask: buildDustMask, drawRings: drawRings, drawSweep: drawSweep,
-  drawContacts: drawContacts, drawAnomaly: drawAnomaly, drawBandLadder: drawBandLadder,
-  drawTelemetry: drawTelemetry, drawSpectrum: drawSpectrum, drawDossier: drawDossier,
-  drawStatus: drawStatus, drawReticle: drawReticle, composite: composite, project: project
 };
 window.artPiece = window.parallax;
 

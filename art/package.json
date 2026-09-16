@@ -1,9 +1,8 @@
 {
   "name": "art",
-  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Self-contained generative pieces. One HTML file each, no media, no external references. The tools prove it.",
+  "description": "Self-contained procedural animations. The pieces need no dependencies; the tools that verify them need a headless browser.",
   "scripts": {
     "verify": "node verify.mjs",
     "scan": "node verify.mjs --scan-only",
@@ -13,6 +12,7 @@
     "ablate": "node tools/ablate.mjs"
   },
   "devDependencies": {
-    "playwright": "^1.48.0"
-  }
+    "playwright-core": "^1.49.0"
+  },
+  "engines": { "node": ">=18" }
 }

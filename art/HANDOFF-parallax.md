@@ -4,7 +4,7 @@ Everything needed to pick this up in another repo, in another session, with no
 memory of how it was built.
 
 **What it is.** `parallax.html` is a single file — one `<canvas>`, one
-`<script>`, 86 KB — that draws the Milky Way as a galactic survey console and
+`<script>`, 83 KB — that draws the Milky Way as a galactic survey console and
 sweeps it through the electromagnetic spectrum over 96 seconds. There are no
 images, no video, no audio files, no fonts and no external references of any
 kind. Every pixel and every sample is computed at runtime. It is interactive:
@@ -20,20 +20,30 @@ does **not** copy that piece's optical model. See §3.
 
 Copy the whole `art/` folder. It is self-contained.
 
-| path | lines | what it is | required? |
-|---|---|---|---|
-| `parallax.html` | 2268 | the piece. This *is* the deliverable | yes |
-| `README.md` | — | user-facing: controls, technique, how to verify | yes |
-| `HANDOFF.md` | — | this document | yes |
-| `verify.mjs` | 120 | proves the no-media claim; renders frames; checks determinism | yes |
-| `package.json` | — | one devDependency, npm script aliases | yes |
-| `tools/lib.mjs` | 172 | shared: find Chromium, open a piece offline, parse args | yes |
-| `tools/sheet.mjs` | 92 | contact sheet — the tool you will use most | yes |
-| `tools/patch.mjs` | 118 | replace one function by name inside the HTML | yes |
-| `tools/smoke.mjs` | 104 | runtime test: loop, audio, keys, resize, interaction, offline | recommended |
-| `tools/audio.mjs` | 98 | proves the synth actually built and is scheduling | recommended |
-| `tools/ablate.mjs` | 74 | where the frame time really goes | when optimising |
-| `.renders/` | — | tool output. Gitignore it | no |
+`art/` holds two pieces and one shared set of tools. The tools know nothing
+about either piece beyond the contract in §5.
+
+| path | what it is | required? |
+|---|---|---|
+| `parallax.html` | the piece. This *is* the deliverable | yes |
+| `lamplighter.html` | the sibling piece — the riso print this one is the mirror of | no |
+| `README.md` | user-facing: both pieces, controls, technique, how to verify | yes |
+| `HANDOFF-parallax.md` | this document | yes |
+| `HANDOFF-lamplighter.md` | the sibling's handoff. Read its §3 next to §3 of this one | no |
+| `verify.mjs` | purity scan, headless render, determinism check | yes |
+| `package.json` | one devDependency, script aliases | yes |
+| `tools/lib.mjs` | find Chromium, open a piece offline, parse args | yes |
+| `tools/sheet.mjs` | contact sheet — the tool you will use most | yes |
+| `tools/patch.mjs` | replace one function by name inside the HTML | yes |
+| `tools/smoke.mjs` | loop, audio, keys, pointer, resize, offline | recommended |
+| `tools/audio.mjs` | proves the synth built and is scheduling | recommended |
+| `tools/ablate.mjs` | where the frame time really goes | when optimising |
+| `.renders/` | tool output. Gitignore it | no |
+
+The dependency is **`playwright-core`**, not `playwright` — it never downloads a
+browser, it uses the one already on the machine. And `launch()` passes
+`--force-color-profile=srgb`, without which rendered frames differ between
+machines and the determinism check below becomes noise.
 
 Add to the destination repo's `.gitignore`:
 
@@ -255,9 +265,8 @@ window.artPiece = {
   purity(),                       // {bytes, clean, found[], canvases, elements}
   info(),                         // {seed, w, h, loop, quality, t, ...}
 
-  // optional, and this piece adds two:
-  view(az, inc, zoom),            // pin the canonical camera
-  __passes                        // the pass table, for tools/ablate.mjs
+  // optional, and this piece adds one:
+  view(az, inc, zoom)             // pin the canonical camera
 }
 ```
 
@@ -267,9 +276,12 @@ frame has to be deterministic no matter what somebody dragged a moment ago.
 view is still exactly reproducible — it just is not always the same three
 numbers. Without it, half of what this piece does is invisible to the tooling.
 
-`__passes` exists only so `tools/ablate.mjs` can swap a pass for a no-op from
-outside the IIFE. `render()` dispatches through it. If you add a draw pass, add
-it to the table or it will be invisible to the profiler.
+**Do not add a debug hook for the profiler.** `tools/ablate.mjs` rewrites
+`render()`'s call sites into a temp copy of the file and runs that, so it needs
+nothing from the piece at all. It finds any call in `render()` shaped
+`name(g, k, T, ...)`, plus `composite(T)` and `overlay(T)`. Calls outside that
+shape — here `project()` and `buildDustMask(T)` — are invisible to it, which is
+a fine trade for shipping a deliverable with no debug surface in it.
 
 Keys: click/space sound · drag orbit · wheel zoom · click to lock · `esc` clear ·
 `1`–`5` band · `n` new seed · `p` pause · `[` `]` scrub · `g` grid · `r` record ·
@@ -283,7 +295,7 @@ Keys: click/space sound · drag orbit · wheel zoom · click to lock · `esc` cl
 patch one function  →  render frames  →  look at them  →  decide  →  repeat
 ```
 
-**Do not edit this file line by line.** It is 2268 lines inside one HTML file and
+**Do not edit this file line by line.** It is 2256 lines inside one HTML file and
 the unit of change that matters is the function. Line-based edits at this size
 are how you end up with two definitions of `drawDust` and no idea which one runs.
 `tools/patch.mjs` refuses outright if it finds a name defined twice.
@@ -414,16 +426,30 @@ The obvious way to remove light is `destination-out`. On a canvas created with
 `multiply` toward black is exactly `dst * (1 - a)`, is well defined on an opaque
 canvas, and is faster.
 
-### 5. A pass table that nothing dispatches through is decorative
+### 5. Check whether the tool already exists
 
-Exposed `__passes` for the ablation harness and it reported every cost as zero.
-Function *declarations* inside an IIFE bind at the call site; reassigning the
-table entry changes nothing, because `render()` was still calling `drawDust`
-directly. Had to route `render()` through `PASS.drawDust(...)` for the swap to
-mean anything.
+The tooling described in the first piece's handoff did not arrive with it, so I
+rebuilt all seven files from the prose descriptions — about 770 lines. The real
+folder turned up afterwards, and on every point of difference the original was
+better:
 
-**Lesson:** a seam you can see from outside is not a seam unless the inside goes
-through it.
+- it depends on **`playwright-core`**, which never tries to download a browser
+- it passes **`--force-color-profile=srgb`**, without which frames differ
+  between machines and a determinism check is meaningless
+- `verify.mjs` deliberately imports nothing, so `--scan-only` really does run
+  anywhere, and it *skips* the render pass rather than failing when there is no
+  browser
+- `ablate.mjs` rewrites `render()`'s call sites into a temp file instead of
+  asking the piece to expose anything
+
+That last one cost the most. I had added a `__passes` table to the deliverable,
+routed `render()` through it, and written a handoff lesson about how a seam has
+to be dispatched through to be real. The hook and the lesson were both answers
+to a problem that existed only because I had not asked for the tool first. The
+hook is out; this is the lesson that replaced it.
+
+**Ask for the existing implementation before rebuilding from a description.**
+A spec tells you what a tool does. It does not tell you what it learned.
 
 ### 6. Scale discipline, or: the halo full of sensor dust
 
@@ -451,19 +477,23 @@ than trust the claim.
 
 ## 9. Performance: measured, inferred, unknown
 
-**Measured, headless (1280×800, software rasterisation), quality 1, frame 1440:**
-~119 ms/frame. Ablation ranking:
+**Measured, headless (1280×800, software rasterisation), quality 1, frame 1440**
+via `npm run ablate -- --piece parallax.html --frame 1440`: ~121 ms/frame.
 
 ```
-composite       40.0     full-screen: bloom, noise, mask, scanlines, glass
-drawDust        29.9     three full-screen multiply composites of the mask
-drawStars       29.8     11,000 stars × 3 channels
-buildDustMask   14.1     ~600 sprite draws, once per frame
-drawHII          9.4
-drawHalo         9.1
-drawArmGas       8.8
-...everything else under 6
+composite       34.3     full-screen: bloom, noise, mask, scanlines, glass
+drawDust        27.1     three full-screen multiply composites of the mask
+drawStars       26.5     11,000 stars × 3 channels
+drawHII          9.6
+drawGlobs        6.2
+drawArmGas       5.6
+drawHalo         5.4
+...everything else under 5
 ```
+
+`buildDustMask` is absent because it is called as `dustOn = buildDustMask(T)`,
+which is not the call shape ablate rewrites; measured on its own it is ~14 ms.
+Same for `project()`.
 
 **Inferred:** headless Chromium here runs software rasterisation via SwiftShader,
 roughly an order of magnitude slower than a GPU-backed canvas. Note that the top
@@ -487,8 +517,8 @@ If you optimise, in order of value:
    1/8 instead of two would cost little visually.
 2. `drawStars` — the bucket count (`NB`, 14) trades fillStyle changes against
    loop iterations; 10 would probably do.
-3. `buildDustMask` — the mask only changes when the camera or band changes.
-   Caching it across frames while both are static is the obvious win and nobody
+3. `buildDustMask` — ~14 ms, and the mask only changes when the camera or the
+   band moves. Caching it while both are static is the obvious win and nobody
    has done it.
 
 ---
@@ -512,9 +542,9 @@ Honest list. None of these are hidden by the tests.
 - **Portrait wastes vertical space.** The galaxy scales on the short edge, so a
   tall window gets large empty margins. Correct behaviour for a circular subject,
   but a portrait-specific layout would use the room.
-- **`verify.mjs` scans every `.html` file in the folder.** Dropping an unrelated
-  HTML file into `art/` will make it try to boot it as a piece and fail on
-  `window.artReady`.
+- **`verify.mjs` scans every `.html` file in the folder**, which is how one
+  command checks both pieces — but dropping an unrelated HTML file into `art/`
+  makes it try to boot that as a piece and hang on `window.artReady`.
 - **Touch is partly untested.** Pointer events cover drag and tap and were
   exercised in the smoke test, but pinch-zoom has no dedicated handler — it
   relies on wheel events, which not every mobile browser synthesises.
@@ -559,11 +589,11 @@ real-time recorder cannot.
 ```bash
 node verify.mjs --scan-only                      # no deps; purity + syntax
 npm run verify                                   # + headless render, determinism
-npm run verify -- --seed 23 --frames 0,1440      # pick seed and frames
-npm run sheet  -- --seed 23 --cols 3             # contact sheet -> .renders/sheet.png
-npm run smoke                                    # loop, audio, keys, resize, interaction
-npm run audio  -- --at 2880 --seconds 14         # audio graph; probe where events are
-npm run ablate -- --frame 1440                   # where the frame time goes
+npm run verify -- --seed 23 --frames 0,1440      # both pieces; pick seed and frames
+npm run sheet  -- --piece parallax.html --seed 23 --cols 3
+npm run smoke  -- --piece parallax.html          # loop, audio, keys, pointer
+npm run audio  -- --piece parallax.html --at 2880 --seconds 14
+npm run ablate -- --piece parallax.html --frame 1440
 node tools/patch.mjs parallax.html drawDust /tmp/new.js
 CHROME_PATH=/path/to/chrome npm run verify       # if Chromium is not auto-found
 ```

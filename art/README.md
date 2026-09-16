@@ -7,7 +7,14 @@ to make the look-and-revise loop possible.
 
 | piece | what it is |
 |---|---|
+| `lamplighter.html` | a lighthouse through a 96-second day, as a three-plate risograph print |
 | `parallax.html` | a galactic survey console. The Milky Way, three phosphor channels, a 96-second sweep up the spectrum and back, and an instrument looking at it |
+
+The two are worth reading together. Lamplighter composites three inks onto paper
+with `multiply`, so nothing can be *lighter* than the paper and highlights are
+knocked out. Parallax composites three phosphor channels onto the void with
+`lighter`, so nothing can be *darker* than the void and shadows are subtracted.
+Same architecture, mirrored optics — see §3 of either handoff.
 
 ---
 
@@ -101,22 +108,24 @@ and not just a looping palette.
 ```bash
 # 1. no dependencies at all. Works on any machine with node.
 node verify.mjs --scan-only
-#     ok   parallax.html  (83.9 KB)  no embedded media, no external references
+#   ok   lamplighter.html  (57.7 KB)  no embedded media, no external references
+#   ok   parallax.html     (82.9 KB)  no embedded media, no external references
 
-# 2. the tools. One package. Browsers are NOT downloaded — it finds yours.
+# 2. the tools. One package — playwright-core, which uses the browser you
+#    already have rather than downloading one.
 npm install
 
-# 3. the claim checked properly: headless, network hard-blocked, both ways
+# 3. the claim checked properly: headless, network hard-blocked, both pieces
 npm run verify
-#     ok   parallax.html  self-audit clean, 1 canvas, 2 body children,
-#          off-file requests 0, 5 frames rendered, determinism ok
+#   ok   parallax.html  self-audit clean, 1 canvas, 2 body children,
+#        off-file requests 0, 5 frames rendered, determinism ok
 
 # 4. it actually runs
-npm run smoke
-#   ok — loop, audio, keys, resize, interaction, offline
+npm run smoke -- --piece parallax.html
+#   ok — loop, audio, keys, pointer, resize, offline
 
 # 5. look at it
-npm run sheet -- --seed 23 --frames 0,720,1440,2160,2880,4320
+npm run sheet -- --piece parallax.html --seed 23 --frames 0,720,1440,2160,2880,4320
 ```
 
 Then open `parallax.html` in a browser and click once for sound.
@@ -131,13 +140,17 @@ so "same seed and frame gives the same pixels" is checked rather than asserted.
 
 | | |
 |---|---|
-| `verify.mjs` | the purity scan, a syntax check, the headless render, and the determinism comparison |
+| `verify.mjs` | the purity scan, the headless render with the network blocked, and the determinism comparison |
 | `tools/sheet.mjs` | contact sheet — the one you will use most |
 | `tools/patch.mjs` | replace one function by name inside the HTML |
-| `tools/smoke.mjs` | loop, audio, keys, resize, interaction, offline |
+| `tools/smoke.mjs` | loop, audio, keys, pointer, resize, offline |
 | `tools/audio.mjs` | proves the synth built and is scheduling |
 | `tools/ablate.mjs` | where the frame time really goes |
 
-Read `HANDOFF.md` before changing anything. In particular: edit by *function*,
-not by line, and confirm anything suspicious at full size — a contact sheet hides
-exactly the detail you are looking for.
+Every tool takes `--piece`, and defaults to `lamplighter.html`. `verify.mjs`
+covers every piece in the folder in one run.
+
+Read the handoff for whichever piece you are touching —
+`HANDOFF-parallax.md` or `HANDOFF-lamplighter.md` — before changing anything. In
+particular: edit by *function*, not by line, and confirm anything suspicious at
+full size, because a contact sheet hides exactly the detail you are looking for.

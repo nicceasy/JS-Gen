@@ -1,98 +1,86 @@
-// tools/audio.mjs — is the synth actually built, and is it scheduling?
+#!/usr/bin/env node
 //
-//   npm run audio -- --at 2400 --seconds 19
+// Audio graph probe. A synthesised soundtrack fails silently: no error, no
+// sound, and a screenshot cannot tell you. This wraps AudioContext before the
+// page loads and counts what actually gets built and started.
 //
-// Two lessons are baked in here, both from HANDOFF.md §8.6.
+// Two things to know, both learned the hard way:
+//   1. createGain, createOscillator and friends live on BaseAudioContext, not
+//      on AudioContext. Instrumenting AudioContext.prototype alone sees almost
+//      nothing and looks like a dead engine. Walk the prototype chain.
+//   2. Note density is driven by how dark it is, so probing at dusk can
+//      legitimately produce zero bells. Probe at night: --at 2400.
 //
-// 1. createGain, createOscillator and nearly everything else live on
-//    BaseAudioContext, not AudioContext. Instrumenting AudioContext.prototype
-//    tallies one method and makes a healthy engine look dead. Walk the chain.
-//
-// 2. Note density in these pieces is driven by the state of the scene. Probing
-//    at the wrong point in the cycle and seeing zero events is not a bug — it is
-//    the piece working. Probe where the events are, and say where you probed.
+//   node tools/audio.mjs
+//   node tools/audio.mjs --at 2400 --seconds 19    # long enough for a foghorn
 
-import { args, pieces, openPiece, pad } from './lib.mjs';
+import { launch, openPiece, args } from './lib.mjs';
 
-const A = args();
-const file = A.file || pieces()[0];
-const at = A.at !== undefined ? parseInt(A.at, 10) : 2400;
-const seconds = A.seconds !== undefined ? parseFloat(A.seconds) : 12;
+const a = args();
+const at = Number(a.at || 2400);
+const secs = Number(a.seconds || 19);
 
-console.log('\n  audio — ' + file + '   probing at frame ' + at +
-  ' (t=' + (at / 60).toFixed(1) + 's)   for ' + seconds + 's\n');
-
-const P = await openPiece(file, { still: false, det: false, frame: at });
-
-// Install the probe BEFORE any gesture, walking the prototype chain so we catch
-// the methods that live on BaseAudioContext.
-await P.page.evaluate(() => {
-  const w = window;
-  w.__tally = {};
-  w.__sched = [];
-  const AC = w.AudioContext || w.webkitAudioContext;
-  if (!AC) return;
-
-  const seen = new Set();
-  let proto = AC.prototype;
-  while (proto && proto !== Object.prototype) {
-    for (const name of Object.getOwnPropertyNames(proto)) {
-      if (!/^create/.test(name) || seen.has(name)) continue;
-      seen.add(name);
-      const d = Object.getOwnPropertyDescriptor(proto, name);
-      if (!d || typeof d.value !== 'function') continue;
-      const orig = d.value;
-      Object.defineProperty(proto, name, {
-        configurable: true, writable: true,
-        value: function (...a) {
-          w.__tally[name] = (w.__tally[name] || 0) + 1;
-          const node = orig.apply(this, a);
-          // catch scheduled starts — that is what "is it playing" really means
-          if (node && typeof node.start === 'function') {
-            const s = node.start.bind(node);
-            node.start = function (when, ...rest) {
-              w.__sched.push({ type: name.replace('create', ''), when: when || 0 });
-              return s(when, ...rest);
-            };
+const browser = await launch(['--autoplay-policy=no-user-gesture-required']);
+const { page, state } = await openPiece(browser, {
+  piece: a.piece || 'lamplighter.html',
+  seed: a.seed || 11,
+  params: 'f=' + at,
+  width: 900,
+  height: 600,
+  initScript: () => {
+    window.__tally = { ctx: 0, nodes: {}, started: 0 };
+    const AC = window.AudioContext;
+    window.AudioContext = function () {
+      const c = new AC();
+      window.__tally.ctx++;
+      window.__ac = c;
+      const keys = new Set();
+      for (let o = Object.getPrototypeOf(c); o; o = Object.getPrototypeOf(o)) {
+        Object.getOwnPropertyNames(o).forEach(n => keys.add(n));
+      }
+      for (const k of keys) {
+        if (!k.startsWith('create')) continue;
+        const orig = c[k];
+        if (typeof orig !== 'function') continue;
+        c[k] = function (...z) {
+          window.__tally.nodes[k] = (window.__tally.nodes[k] || 0) + 1;
+          const n = orig.apply(c, z);
+          if (n && typeof n.start === 'function') {
+            const s = n.start.bind(n);
+            n.start = (...y) => { window.__tally.started++; return s(...y); };
           }
-          return node;
-        }
-      });
-    }
-    proto = Object.getPrototypeOf(proto);
+          return n;
+        };
+      }
+      return c;
+    };
   }
-  w.__probeMethods = seen.size;
 });
 
-const methods = await P.page.evaluate(() => window.__probeMethods || 0);
-console.log('    probe wrapped ' + methods + ' create* methods across the prototype chain');
+await page.mouse.click(450, 300);
+await page.waitForTimeout(1200);
+const early = await page.evaluate(() => JSON.parse(JSON.stringify(window.__tally)));
+await page.waitForTimeout(Math.max(0, secs - 1.2) * 1000);
+const late = await page.evaluate(() => ({
+  tally: JSON.parse(JSON.stringify(window.__tally)),
+  state: window.__ac ? window.__ac.state : 'none',
+  clock: window.__ac ? +window.__ac.currentTime.toFixed(2) : -1
+}));
+await browser.close();
 
-// a gesture, then listen
-await P.page.locator('canvas').click({ position: { x: 30, y: 30 } });
-await P.page.waitForTimeout(600);
+const delta = {};
+for (const k of new Set([...Object.keys(early.nodes), ...Object.keys(late.tally.nodes)])) {
+  const d = (late.tally.nodes[k] || 0) - (early.nodes[k] || 0);
+  if (d) delta[k] = d;
+}
+console.log('context           ' + late.state + ', clock ' + late.clock + 's');
+console.log('built at boot     ' + JSON.stringify(early.nodes));
+console.log('sources started   ' + early.started + ' at boot -> ' + late.tally.started + ' after ' + secs + 's');
+console.log('scheduled since   ' + (Object.keys(delta).length ? JSON.stringify(delta) : 'NOTHING'));
+console.log(state.errors.length ? 'errors:\n  ' + state.errors.join('\n  ') : 'no page errors');
 
-const built = await P.page.evaluate(() => ({ ...window.__tally }));
-console.log('\n    graph built');
-const keys = Object.keys(built).sort();
-if (!keys.length) console.log('      (nothing — the engine did not build)');
-for (const k of keys) console.log('      ' + pad(k, 26) + built[k]);
-
-await P.page.waitForTimeout(seconds * 1000);
-
-const sched = await P.page.evaluate(() => window.__sched.slice());
-const byType = {};
-for (const s of sched) byType[s.type] = (byType[s.type] || 0) + 1;
-
-console.log('\n    scheduled over ' + seconds + 's');
-const st = Object.keys(byType).sort();
-if (!st.length) console.log('      (no start() calls — either silent, or probed at a quiet point in the cycle)');
-for (const k of st) console.log('      ' + pad(k, 26) + byType[k]);
-
-const info = await P.info();
-console.log('\n    scene at probe time: ' + JSON.stringify(info));
-
-await P.close();
-
-const ok = keys.length > 0;
-console.log('\n  ' + (ok ? 'ok — the synth built and is scheduling' : 'FAILED — no audio graph') + '\n');
-process.exit(ok ? 0 : 1);
+const droneUp = early.started >= 6;
+const scheduling = late.tally.started > early.started;
+if (!droneUp) console.log('\nFAIL: the standing layer (drone, surf, wind) did not start');
+if (!scheduling) console.log('\nFAIL: nothing was scheduled after boot — check the lookahead scheduler');
+process.exit(droneUp && scheduling && !state.errors.length ? 0 : 1);

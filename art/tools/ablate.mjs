@@ -1,72 +1,70 @@
-// tools/ablate.mjs — where the frame time really goes.
+#!/usr/bin/env node
 //
-//   npm run ablate -- --frame 1800
+// Where is the frame time going?
 //
-// This is not a profiler, and that is the point (HANDOFF.md §8.3).
+// Do not reach for a per-function timer first. Canvas work is deferred: calls
+// queue and only rasterise when something forces a flush, so a naive profiler
+// blames whichever function happens to trigger it — here, composite() appeared
+// to cost 96ms of a 102ms frame, which was every other function's work in a
+// trench coat.
 //
-// Wrapping each draw call in performance.now() reports nonsense, because canvas
-// work is deferred: calls queue and only rasterise when something forces a flush.
-// Whichever function happens to touch the buffers first gets charged for
-// everyone else's work. On the first piece that made composite() look like 96 ms
-// of a 102 ms frame. It was not.
+// Ablation avoids the problem entirely. Skip one draw call, measure the whole
+// frame, and the difference is what that call really costs.
 //
-// So: skip one function, measure the WHOLE frame, take the difference. Slower to
-// run, but it is measuring the thing you actually care about.
+//   node tools/ablate.mjs
+//   node tools/ablate.mjs --frame 1800 --reps 25
 
-import { args, pieces, openPiece, pad } from './lib.mjs';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { launch, openPiece, args, ART } from './lib.mjs';
 
-const A = args();
-const file = A.file || pieces()[0];
-const frame = A.frame !== undefined ? parseInt(A.frame, 10) : 1800;
-const reps = A.reps !== undefined ? parseInt(A.reps, 10) : 7;
+const a = args();
+const piece = a.piece || 'lamplighter.html';
+const frame = Number(a.frame || 1800);
+const reps = Number(a.reps || 25);
 
-console.log('\n  ablate — ' + file + '   frame ' + frame + '   ' + reps + ' reps each\n');
+// Rewrite the calls inside render() to route through a skippable shim. Only the
+// call sites are touched, never the definitions.
+const src = fs.readFileSync(path.join(ART, piece), 'utf8');
+const at = src.indexOf('function render(T) {');
+if (at < 0) { console.error('no render(T) in ' + piece); process.exit(1); }
+const head = src.slice(0, at), rest = src.slice(at);
+const end = rest.indexOf('\n}\n');
+let body = rest.slice(0, end);
+const names = new Set();
+body = body.replace(/^(\s+)([a-zA-Z]\w*)\((g, k, T[^;]*)\);$/gm, (m, ind, fn, argl) => {
+  names.add(fn);
+  return `${ind}PF('${fn}',function(){${fn}(${argl});});`;
+});
+body = body.replace(/^(\s+)(composite|overlay)\((T)\);$/gm, (m, ind, fn, argl) => {
+  names.add(fn);
+  return `${ind}PF('${fn}',function(){${fn}(${argl});});`;
+});
+const shim = 'window.__skip={};function PF(n,f){if(window.__skip[n])return;f();}\n';
+const tmp = path.join(os.tmpdir(), 'ablate-' + Date.now() + '-' + piece);
+fs.writeFileSync(tmp, head + shim + body + rest.slice(end));
 
-const P = await openPiece(file, { seed: A.seed !== undefined ? parseInt(A.seed, 10) : 7, frame });
+const browser = await launch();
+const { page, state } = await openPiece(browser, { piece: tmp, seed: a.seed || 7 });
+const run = skip => page.evaluate(({ s, f, r }) => {
+  window.__skip = s;
+  window.artPiece.frame(f);
+  const t0 = performance.now();
+  for (let i = 0; i < r; i++) window.artPiece.frame(f + i * 3);
+  return +((performance.now() - t0) / r).toFixed(1);
+}, { s: skip, f: frame, r: reps });
 
-const report = await P.page.evaluate(async ({ frame, reps }) => {
-  // Every draw* function the piece hung on window, plus composite.
-  const table = window.artPiece.__passes;
-  if (!table) return { found: 0, base: 0, rows: [] };
-  const names = Object.keys(table);
+const base = await run({});
+const rows = [];
+for (const n of names) rows.push([n, base - await run({ [n]: 1 })]);
+rows.sort((x, y) => y[1] - x[1]);
+await browser.close();
+fs.unlinkSync(tmp);
 
-  function time() {
-    // a real flush: read one pixel back, which forces everything queued to land
-    const t0 = performance.now();
-    for (let i = 0; i < reps; i++) {
-      window.artPiece.frame(frame);
-      document.querySelector('canvas').getContext('2d').getImageData(0, 0, 1, 1);
-    }
-    return (performance.now() - t0) / reps;
-  }
-
-  const base = time();
-  const rows = [];
-  for (const n of names) {
-    const orig = table[n];
-    table[n] = n === 'buildDustMask' ? function () { return false; } : function () {};
-    const without = time();
-    table[n] = orig;
-    rows.push({ name: n, cost: base - without });
-  }
-  rows.sort((a, b) => b.cost - a.cost);
-  return { base, rows, found: names.length };
-}, { frame, reps });
-
-if (!report.found) {
-  console.log('    this piece exposes no pass table.\n' +
-    '    ablate needs window.artPiece.__passes — a plain object of the draw\n' +
-    '    functions that render() dispatches through.\n');
-} else {
-  console.log('    whole frame: ' + report.base.toFixed(1) + ' ms\n');
-  for (const r of report.rows) {
-    if (Math.abs(r.cost) < 0.05) continue;
-    const bar = '█'.repeat(Math.max(0, Math.round(r.cost / report.base * 46)));
-    console.log('      ' + pad(r.name, 20) + pad(r.cost.toFixed(1), 7) + bar);
-  }
-  console.log('\n    (negative or near-zero means the call is free at this frame —\n' +
-    '     a night-only effect measured at noon, say. Ablate at several frames.)');
-}
-
-await P.close();
-console.log('');
+console.log('frame ' + frame + ', ' + reps + ' reps, baseline ' + base + ' ms/frame');
+console.log('(headless software rasterisation — roughly an order of magnitude');
+console.log(' slower than a GPU canvas. Read the ranking, not the absolutes.)\n');
+for (const [n, ms] of rows) console.log('  ' + n.padEnd(15) + (ms > 0 ? ms.toFixed(1) : '~0'));
+console.log('\n  ' + 'composite'.padEnd(15) + 'if this dominates it is the flush, not the blend');
+if (state.errors.length) console.log('\npage errors:\n  ' + state.errors.join('\n  '));
