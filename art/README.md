@@ -8,13 +8,39 @@ to make the look-and-revise loop possible.
 | piece | what it is |
 |---|---|
 | `lamplighter.html` | a lighthouse through a 96-second day, as a three-plate risograph print |
-| `parallax.html` | a galactic survey console. The Milky Way, three phosphor channels, a 96-second sweep up the spectrum and back, and an instrument looking at it |
+| `parallax.html` | a galactic survey console. The Milky Way in three phosphor channels, swept up the spectrum and back |
+| `apogee.html` | race control for an orbital sport. A rotatable Earth, the Moon, and six craft on Kepler orbits, drawn by one beam |
 
-The two are worth reading together. Lamplighter composites three inks onto paper
-with `multiply`, so nothing can be *lighter* than the paper and highlights are
-knocked out. Parallax composites three phosphor channels onto the void with
-`lighter`, so nothing can be *darker* than the void and shadows are subtracted.
-Same architecture, mirrored optics — see §3 of either handoff.
+They are worth reading together, because each one is the same architecture under
+a different optical constraint — three channels, per-channel densities, no
+colour variable anywhere, one scalar driving the whole image:
+
+| | composites | the constraint | so |
+|---|---|---|---|
+| Lamplighter | three inks, `multiply`, onto paper | nothing can be **lighter** than the paper | highlights are knocked out |
+| Parallax | three channels, `lighter`, onto the void | nothing can be **darker** than the void | shadows are subtracted |
+| Apogee | three guns, one beam, on a vector tube | nothing can be **filled** | brightness is dwell time |
+
+§3 of each handoff is the short version.
+
+---
+
+## Apogee
+
+Race control for an orbital sport. Drag to rotate the Earth, wheel out to the
+whole Earth–Moon system, click a craft to lock it. Six teams fly Kepler orbits
+through a cislunar circuit; the leaderboard, the bearing marks on the rim and
+the lunar inset all read the same numbers the picture does.
+
+Everything is drawn by one beam, and a vector display has no fill — so the globe
+is a graticule and coastlines, the Moon is a limb and crater rings, and every
+panel is corner marks. Brightness is dwell time: where the beam moves fast the
+trace is dim, where it slows it blooms.
+
+Orbits are sampled in equal **time**, not equal angle, so the samples crowd
+where a craft is slow. The display blooms at apogee, and the sport is named for
+it. Nobody wrote that — it falls out of doing the orbital mechanics properly and
+letting the beam model do what beams do.
 
 ---
 
@@ -150,7 +176,7 @@ so "same seed and frame gives the same pixels" is checked rather than asserted.
 Every tool takes `--piece`, and defaults to `lamplighter.html`. `verify.mjs`
 covers every piece in the folder in one run.
 
-Read the handoff for whichever piece you are touching —
+Read the handoff for whichever piece you are touching — `HANDOFF-apogee.md`,
 `HANDOFF-parallax.md` or `HANDOFF-lamplighter.md` — before changing anything. In
 particular: edit by *function*, not by line, and confirm anything suspicious at
 full size, because a contact sheet hides exactly the detail you are looking for.

@@ -1,0 +1,1707 @@
+<!doctype html><html><head><meta charset="utf8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Apogee</title>
+<style>
+  html,body{height:100%;margin:0;background:#04070a;overflow:hidden}
+  canvas{display:block;width:100%;height:100%;touch-action:none;cursor:none}
+</style></head><body>
+<canvas id="c"></canvas>
+<script>
+/*
+  APOGEE
+  Race control for an orbital sport. Nothing in this file is a picture.
+  Every frame is computed: the Earth, the Moon, the orbits, the sound.
+
+  The third piece in art/, and the third optical model. Lamplighter prints three
+  inks onto paper with `multiply`, so nothing can be lighter than the paper and
+  highlights are knocked out. Parallax adds three phosphor channels onto the void
+  with `lighter`, so nothing can be darker than the void and shadows are
+  subtracted. This one is a vector CRT:
+
+    There is no fill. There is only a beam, and brightness is dwell time.
+
+  Where the beam moves fast it spreads its light over a long distance and the
+  trace is dim; where it slows or turns it lingers and the trace blooms. That is
+  why an oscilloscope square has bright corners and a computer square does not.
+  Everything here goes through beam().
+
+  The sport is a circuit race through cislunar space. Craft fly Kepler orbits and
+  spend a finite budget of delta-v to change them. Which means the display blooms
+  at apogee — where the craft are slowest and the beam lingers longest — and the
+  sport is named for it.
+
+  Structure
+    1  parameters, seeded randomness, Kepler
+    2  the beam       (three guns, dwell-time brightness, P7 persistence)
+    3  the bodies     (Earth graticule and coastlines, the Moon)
+    4  the meet       (the seed decides the teams, the craft, the circuit)
+    5  the lap        (one number: lap phase drives sun, Moon, craft, gates)
+    6  the camera     (one continuous zoom, globe out to the whole system)
+    7  drawing        (Earth, Moon, orbits, craft, the broadcast)
+    8  the screen     (bloom, flicker, glass)
+    9  a frame
+    10 audio          (comms bed, gate tones, lead change — all synthesised)
+    11 the purity check
+    12 the loop, and the hands on it
+
+  URL parameters
+    ?s=5        seed
+    ?f=140      start frame
+    ?still=1    render exactly one frame, then stop
+    ?det=1      advance by a fixed 1/60s per frame instead of wall clock
+
+  Drag to rotate - wheel to zoom from the globe to the Moon - click a craft.
+*/
+(function () {
+'use strict';
+
+// ─────────────────────────────────────────────────────────────── 1. groundwork
+
+var Q = new URLSearchParams(location.search);
+var SEED        = Q.has('s') ? (parseInt(Q.get('s'), 10) | 0) : (Math.random() * 1e9) | 0;
+var START_FRAME = Q.has('f') ? Math.max(0, parseInt(Q.get('f'), 10) | 0) : 0;
+var STILL       = Q.get('still') === '1';
+var DETERM      = Q.get('det') === '1' || STILL;
+var FPS  = 60;
+var LOOP = 96;                     // seconds for one lap of the circuit
+var TAU  = Math.PI * 2;
+var DEG  = Math.PI / 180;
+
+// every period divides LOOP, so the whole piece is a true loop
+var SWEEP_P = LOOP / 8;
+var TICK_P  = LOOP / 64;
+var BLINK_P = LOOP / 32;
+
+// Earth radii throughout. The Moon is 60.3 out and 0.273 across, which is the
+// one pair of numbers that makes a cislunar view feel like the real thing.
+var R_MOON = 0.2727, D_MOON = 60.27;
+
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function lerp(a, b, t)  { return a + (b - a) * t; }
+function smooth(t)      { return t * t * (3 - 2 * t); }
+function sstep(a, b, x) { return smooth(clamp((x - a) / (b - a), 0, 1)); }
+function fract(x)       { return x - Math.floor(x); }
+
+function mulberry32(a) {
+  return function () {
+    a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var rnd = mulberry32(SEED);
+function rr(a, b)  { return a + (b - a) * rnd(); }
+function ri(a, b)  { return Math.floor(rr(a, b + 1)); }
+function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
+
+// Kepler, solved by Newton. Three iterations is plenty below e = 0.9 and it is
+// the reason the craft move correctly — fast at perigee, slow at apogee — which
+// is the whole visual argument of the piece.
+function kepler(M, e) {
+  M = M - TAU * Math.floor(M / TAU);
+  var E = M + e * Math.sin(M) * (1 + e * Math.cos(M));
+  for (var i = 0; i < 4; i++) {
+    var f = E - e * Math.sin(E) - M;
+    E -= f / (1 - e * Math.cos(E));
+  }
+  return E;
+}
+
+// orbital elements -> a point in Earth-centred space
+function orbitAt(o, M) {
+  var E = kepler(M, o.e);
+  var cE = Math.cos(E), sE = Math.sin(E);
+  var px = o.a * (cE - o.e);
+  var py = o.a * Math.sqrt(1 - o.e * o.e) * sE;
+  var cw = o.cw, sw = o.sw, ci = o.ci, si = o.si, cO = o.cO, sO = o.sO;
+  // rotate by argument of periapsis, then inclination, then ascending node
+  var x1 = px * cw - py * sw, y1 = px * sw + py * cw;
+  var y2 = y1 * ci, z2 = y1 * si;
+  return { x: x1 * cO - y2 * sO, y: x1 * sO + y2 * cO, z: z2 };
+}
+
+// cache the trig an orbit never changes
+function prep(o) {
+  o.cw = Math.cos(o.w); o.sw = Math.sin(o.w);
+  o.ci = Math.cos(o.i); o.si = Math.sin(o.i);
+  o.cO = Math.cos(o.O); o.sO = Math.sin(o.O);
+  o.n = TAU / o.P;                         // mean motion, radians per lap-second
+  return o;
+}
+
+// ───────────────────────────────────────────────────────────────── 2. the beam
+//
+// Three guns on one scope. Each is an offscreen canvas starting black; they
+// composite onto the tube face with `lighter`, because light adds.
+//
+// But the colour model is not the idea. THE IDEA IS DWELL TIME.
+//
+// A vector display has no framebuffer and no fill. A shape exists because the
+// beam travelled along it, and how bright a stretch comes out depends on how
+// long the beam spent there. Fast stretches are dim; slow ones and corners
+// bloom. So beam() takes a polyline and gives every segment a brightness from
+// its own length — short segment, slow beam, bright trace.
+//
+// Two consequences run through the whole file:
+//
+//   * Nothing can be filled. Not the Earth, not the Moon, not a panel. Solidity
+//     has to be implied by how densely the beam hatches, which is why the globe
+//     is a graticule and the readouts are outlines.
+//   * To make something brighter, emit more points along it. Brightness is not
+//     a parameter you pass; it is a property of the path you hand over. A craft
+//     at apogee is moving slowly, so consecutive samples land close together,
+//     so it blooms. Nobody wrote that. It falls out.
+//
+// P7 phosphor is a two-layer cascade: a blue-white strike that pumps a
+// green-yellow layer underneath, so the trail is a different colour from the
+// strike. Trails here decay toward GUN.g for exactly that reason, which means
+// age reads as hue while team reads as mix, in one mark.
+
+var GUNS = ['a', 'g', 'r'];
+var GUN = {
+  a: '120,214,255',      // strike: blue-white
+  g: '150,255,130',      // persistence: green-yellow
+  r: '255,116,72'        // the third gun, for teams and for alarm
+};
+var TUBE = '#04070a';
+
+var view = document.getElementById('c');
+var out  = view.getContext('2d', { alpha: false });
+var buf  = {};
+var W = 0, H = 0, CX = 0, CY = 0, SCALE = 1, GU = 12;
+var quality = 1, compact = false;
+
+for (var gi = 0; gi < 3; gi++) {
+  var gk = GUNS[gi], gc = document.createElement('canvas');
+  buf[gk] = { c: gc, g: gc.getContext('2d', { alpha: false }) };
+}
+
+// The reference segment length, in device pixels, at which a trace is at half
+// brightness. Shorter than this blooms, longer fades. This one constant sets
+// the entire feel of the display.
+var DWELL = 7;
+
+// Segment buckets, so fillStyle/strokeStyle changes stay in the low tens per
+// call instead of the thousands. Preallocated; never reallocated.
+var NBK = 9, BKX = [], BKN = new Int32Array(NBK), BKCAP = 6000;
+for (var bi = 0; bi < NBK; bi++) BKX.push(new Float32Array(BKCAP * 4));
+
+// pts is a flat [x0,y0,x1,y1,...]. `gain` scales the whole trace; `lw` is the
+// beam width. Segments longer than the tube are dropped rather than drawn dim,
+// because a real beam that far off is flyback and the scope blanks it.
+function beam(g, k, pts, gain, lw, closed) {
+  var n = pts.length >> 1;
+  if (n < 2 || gain <= 0.004) return;
+  var i, b;
+  for (i = 0; i < NBK; i++) BKN[i] = 0;
+
+  var lim = (n - (closed ? 0 : 1));
+  for (i = 0; i < lim; i++) {
+    var j = (i + 1) % n;
+    var x0 = pts[i * 2], y0 = pts[i * 2 + 1];
+    var x1 = pts[j * 2], y1 = pts[j * 2 + 1];
+    if (x0 !== x0 || x1 !== x1) continue;                       // NaN guard
+    if ((x0 < -W && x1 < -W) || (x0 > W * 2 && x1 > W * 2)) continue;
+    if ((y0 < -H && y1 < -H) || (y0 > H * 2 && y1 > H * 2)) continue;
+    var dx = x1 - x0, dy = y1 - y0;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (len > Math.max(W, H) * 1.2) continue;                   // blanked flyback
+    // the whole piece, in one line
+    var a = gain * DWELL * SCALE / (DWELL * SCALE + len);
+    if (a < 0.012) continue;
+    b = (a * NBK) | 0; if (b >= NBK) b = NBK - 1;
+    var c = BKN[b];
+    if (c >= BKCAP) continue;
+    var o = c * 4, arr = BKX[b];
+    arr[o] = x0; arr[o + 1] = y0; arr[o + 2] = x1; arr[o + 3] = y1;
+    BKN[b] = c + 1;
+  }
+
+  g.globalCompositeOperation = 'lighter';
+  g.lineCap = 'round';
+  for (b = 0; b < NBK; b++) {
+    var cnt = BKN[b];
+    if (!cnt) continue;
+    var alpha = Math.min(1, (b + 0.6) / NBK);
+    g.strokeStyle = 'rgba(' + GUN[k] + ',' + alpha.toFixed(3) + ')';
+    g.lineWidth = Math.max(0.6, (lw || 1) * SCALE * (0.72 + alpha * 0.5));
+    g.beginPath();
+    var arr2 = BKX[b];
+    for (i = 0; i < cnt; i++) {
+      var p = i * 4;
+      g.moveTo(arr2[p], arr2[p + 1]);
+      g.lineTo(arr2[p + 2], arr2[p + 3]);
+    }
+    g.stroke();
+  }
+  g.globalCompositeOperation = 'source-over';
+}
+
+// A spot: where the beam stops entirely. The brightest thing a scope can do.
+var spr = {}, SPR = 64;
+function buildSprites() {
+  for (var i = 0; i < 3; i++) {
+    var k = GUNS[i], c = document.createElement('canvas');
+    c.width = c.height = SPR;
+    var g = c.getContext('2d');
+    var gr = g.createRadialGradient(SPR / 2, SPR / 2, 0, SPR / 2, SPR / 2, SPR / 2);
+    gr.addColorStop(0.00, 'rgba(' + GUN[k] + ',1)');
+    gr.addColorStop(0.14, 'rgba(' + GUN[k] + ',0.55)');
+    gr.addColorStop(0.38, 'rgba(' + GUN[k] + ',0.15)');
+    gr.addColorStop(1.00, 'rgba(' + GUN[k] + ',0)');
+    g.fillStyle = gr;
+    g.fillRect(0, 0, SPR, SPR);
+    spr[k] = c;
+  }
+}
+function spot(g, k, x, y, r, a) {
+  if (a < 0.004 || r < 0.3) return;
+  g.globalCompositeOperation = 'lighter';
+  g.globalAlpha = Math.min(1, a);
+  g.drawImage(spr[k], x - r, y - r, r * 2, r * 2);
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = 'source-over';
+}
+
+var bloomC = null, bloomG = null, bloomS = null, bloomSG = null;
+
+function resize() {
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  var cw = Math.max(320, view.clientWidth || window.innerWidth);
+  var chh = Math.max(240, view.clientHeight || window.innerHeight);
+  var px = cw * chh * dpr * dpr;
+  var cap = 2.4e6;
+  SCALE = dpr * (px > cap ? Math.sqrt(cap / px) : 1);
+  W = Math.round(cw * SCALE); H = Math.round(chh * SCALE);
+  view.width = W; view.height = H;
+  for (var i = 0; i < 3; i++) {
+    var b = buf[GUNS[i]];
+    b.c.width = W; b.c.height = H;
+    b.g.lineCap = 'round'; b.g.lineJoin = 'round';
+  }
+  CX = W * 0.5; CY = H * 0.5;
+  compact = (W / SCALE) < 820 || (H / SCALE) < 540;
+  GU = Math.max(8, Math.round(Math.min(W, H) / 52));
+
+  bloomC = document.createElement('canvas');
+  bloomC.width = Math.max(2, W >> 3); bloomC.height = Math.max(2, H >> 3);
+  bloomG = bloomC.getContext('2d');
+  bloomS = document.createElement('canvas');
+  bloomS.width = Math.max(2, W >> 5); bloomS.height = Math.max(2, H >> 5);
+  bloomSG = bloomS.getContext('2d');
+
+  buildSprites();
+  buildMeet();
+}
+window.addEventListener('resize', function () { clearTimeout(resize._t); resize._t = setTimeout(resize, 120); });
+
+function gx(n) { return Math.round(n / GU) * GU; }
+
+// ───────────────────────────────────────────────────────────────── 3. the bodies
+//
+// Coarse by intent. A scope of this kind traced a few hundred vectors a frame
+// and the Earth on it was a dozen strokes; the recognition comes from the
+// graticule and the shape of the coasts, not from resolution.
+
+// [lon, lat] rings, degrees.
+var COASTS = [
+  // Africa
+  [[10,37],[20,33],[25,32],[33,31],[35,24],[39,15],[43,11],[51,12],[48,4],[41,-1],
+   [40,-10],[40,-17],[35,-24],[32,-29],[25,-34],[18,-34],[12,-17],[9,-1],[9,4],[3,6],
+   [-5,5],[-13,9],[-17,15],[-16,22],[-13,28],[-6,36],[10,37]],
+  // Eurasia
+  [[-10,36],[-9,44],[-2,48],[4,52],[8,57],[11,58],[13,55],[20,56],[24,60],[27,65],
+   [30,70],[40,68],[55,69],[70,73],[80,74],[95,78],[105,77],[115,73],[130,72],[145,72],
+   [160,70],[170,66],[178,65],[170,60],[160,58],[155,52],[143,46],[135,43],[130,35],
+   [122,31],[120,23],[110,20],[105,10],[100,5],[98,8],[95,16],[90,22],[87,21],[80,13],
+   [77,8],[73,20],[68,24],[62,25],[57,25],[50,28],[48,30],[44,37],[36,36],[28,37],
+   [23,38],[15,38],[12,45],[3,43],[-2,36],[-10,36]],
+  // North America
+  [[-168,66],[-160,70],[-150,70],[-140,70],[-125,70],[-110,68],[-95,68],[-85,70],
+   [-75,73],[-65,66],[-60,56],[-55,52],[-64,45],[-70,42],[-74,39],[-79,33],[-81,26],
+   [-84,30],[-90,29],[-97,26],[-97,20],[-95,16],[-87,13],[-83,9],[-79,9],[-83,15],
+   [-92,17],[-105,20],[-110,24],[-114,30],[-120,34],[-124,42],[-125,49],[-132,55],
+   [-140,60],[-150,60],[-160,58],[-165,62],[-168,66]],
+  // South America
+  [[-75,10],[-68,11],[-60,8],[-52,5],[-50,0],[-44,-2],[-38,-6],[-35,-8],[-39,-14],
+   [-41,-22],[-48,-25],[-53,-34],[-58,-38],[-62,-40],[-65,-45],[-68,-50],[-69,-55],
+   [-73,-52],[-75,-45],[-74,-38],[-71,-30],[-70,-23],[-71,-18],[-76,-14],[-81,-6],
+   [-80,0],[-78,6],[-75,10]],
+  // Australia
+  [[113,-22],[114,-27],[118,-34],[125,-33],[132,-32],[138,-35],[145,-38],[150,-37],
+   [153,-30],[153,-25],[148,-20],[145,-15],[142,-11],[136,-12],[130,-12],[125,-14],
+   [122,-18],[113,-22]],
+  // Greenland
+  [[-45,60],[-38,65],[-25,70],[-20,76],[-25,81],[-40,83],[-55,82],[-62,77],[-55,70],
+   [-50,64],[-45,60]],
+  // Antarctica, as a ring at the bottom
+  [[-180,-70],[-140,-73],[-100,-73],[-60,-64],[-20,-70],[20,-70],[60,-67],[100,-66],
+   [140,-67],[180,-70]],
+  // a few that read at a glance
+  [[130,31],[136,35],[140,40],[142,44],[139,35],[133,33],[130,31]],                 // Japan
+  [[-6,50],[-3,54],[-2,58],[-5,58],[-6,54],[-6,50]],                                // Britain
+  [[43,-12],[49,-15],[50,-22],[45,-25],[43,-18],[43,-12]],                          // Madagascar
+  [[166,-45],[173,-41],[178,-38],[174,-36],[168,-44],[166,-45]],                    // New Zealand
+  [[-85,22],[-78,21],[-74,20],[-80,23],[-85,22]]                                    // Cuba
+];
+
+// Ground stations, which in this sport are the relay network the craft must stay
+// in contact with. Real places; approximate coordinates.
+var STATIONS = [
+  ['CANBERRA', 148.98, -35.40], ['MADRID', -4.25, 40.43], ['GOLDSTONE', -116.89, 35.43],
+  ['KOUROU', -52.80, 5.25], ['SVALBARD', 15.39, 78.23], ['MCMURDO', 166.67, -77.85],
+  ['KASHIMA', 140.66, 35.95], ['SANTIAGO', -70.67, -33.15], ['HARTEBEESTHOEK', 27.69, -25.89],
+  ['WEILHEIM', 11.08, 47.88], ['ALICE SPRINGS', 133.88, -23.70], ['FAIRBANKS', -147.50, 64.97]
+];
+
+function sph(lon, lat, r) {
+  var la = lat * DEG, lo = lon * DEG, cl = Math.cos(la);
+  return { x: r * cl * Math.cos(lo), y: r * cl * Math.sin(lo), z: r * Math.sin(la) };
+}
+
+// ────────────────────────────────────────────────────────────────── 4. the meet
+//
+// The circuit and the bodies are fixed; the seed decides the meet. Which teams
+// turned up, what trajectories they filed, where the gates were set this
+// season, and who is having a bad day.
+
+var TEAM_NAMES = ['MERIDIAN', 'KESTREL', 'ORBITAL DYNAMICS', 'NINE LIVES', 'HALDANE',
+                  'BLUE SHIFT', 'ARGENT', 'PERIHELION', 'CASTOR LINE', 'VANTAGE',
+                  'TERMINUS', 'DEADWEIGHT', 'LONG PARALLAX', 'SOLSTICE'];
+var PILOT_FIRST = ['R.', 'M.', 'J.', 'A.', 'K.', 'T.', 'S.', 'N.', 'E.', 'V.', 'L.', 'D.'];
+var PILOT_LAST  = ['OYELARAN', 'VASQUEZ', 'NAKAMURA', 'ODUYA', 'HALVORSEN', 'BRENNAN',
+                   'SOLANKI', 'MWANGI', 'ARCHAMBAULT', 'RUIZ', 'TEMPLETON', 'OKONKWO',
+                   'LINDQVIST', 'FERREIRA', 'ADEYEMI', 'KOVACS'];
+
+// A team is a beam mix, not a colour. Six that stay apart on a three-gun tube.
+var TEAM_MIX = [
+  { a: 1.00, g: 0.10, r: 0.06 },   // blue-white
+  { a: 0.06, g: 0.14, r: 1.00 },   // orange
+  { a: 0.10, g: 1.00, r: 0.10 },   // green
+  { a: 0.16, g: 0.82, r: 0.90 },   // amber
+  { a: 0.92, g: 0.12, r: 0.78 },   // magenta
+  { a: 0.74, g: 0.86, r: 0.20 }    // pale cyan-green
+];
+
+var world = null;
+
+function buildMeet() {
+  rnd = mulberry32(SEED);
+  var w = {}, i, j;
+
+  // ── the circuit. Gates sit on real orbital geometry: two in low orbit, one
+  //    at the far turn out by the Moon, one on the way back in.
+  w.gates = [];
+  var gateDefs = [
+    { name: 'GATE 1 - PERIGEE',   r: 1.28,  inc: 28,  node: 10,  ph: 0.00 },
+    { name: 'GATE 2 - ASCENDING', r: 3.40,  inc: 28,  node: 10,  ph: 0.38 },
+    { name: 'GATE 3 - THE TURN',  r: 54.0,  inc: 18,  node: 24,  ph: 0.50 },
+    { name: 'GATE 4 - LUNAR',     r: 60.27, inc: 12,  node: 40,  ph: 0.58 },
+    { name: 'GATE 5 - DESCENDING',r: 12.0,  inc: 24,  node: 14,  ph: 0.82 }
+  ];
+  for (i = 0; i < gateDefs.length; i++) {
+    var gd = gateDefs[i];
+    var th = gd.ph * TAU + rr(-0.06, 0.06);
+    var inc = (gd.inc + rr(-3, 3)) * DEG, nod = (gd.node + rr(-8, 8)) * DEG;
+    var rr2 = gd.r * rr(0.96, 1.04);
+    var bx = rr2 * Math.cos(th), by = rr2 * Math.sin(th);
+    var y2 = by * Math.cos(inc), z2 = by * Math.sin(inc);
+    w.gates.push({
+      name: gd.name, idx: i, ph: gd.ph,
+      x: bx * Math.cos(nod) - y2 * Math.sin(nod),
+      y: bx * Math.sin(nod) + y2 * Math.cos(nod),
+      z: z2,
+      rad: gd.r > 30 ? 2.6 : gd.r > 6 ? 0.9 : 0.20,
+      tilt: rr(0, TAU)
+    });
+  }
+
+  // ── the field. Every craft flies a cislunar ellipse: perigee just above the
+  //    atmosphere, apogee out near the Moon. What separates them is the
+  //    elements they filed and how much delta-v they have left to fix them.
+  var nTeams = 6;
+  var names = TEAM_NAMES.slice();
+  w.craft = [];
+  for (i = 0; i < nTeams; i++) {
+    var ti = (rnd() * names.length) | 0;
+    var team = names.splice(ti, 1)[0];
+    var apo = rr(44, 62), per = rr(1.09, 1.35);
+    var a = (apo + per) / 2, e = (apo - per) / (apo + per);
+    var o = prep({
+      a: a, e: e,
+      i: rr(8, 31) * DEG,
+      O: rr(0, 360) * DEG,
+      w: rr(-26, 26) * DEG,
+      P: LOOP                                   // one lap of the circuit
+    });
+    w.craft.push({
+      n: i, team: team, mix: TEAM_MIX[i],
+      pilot: pick(PILOT_FIRST) + ' ' + pick(PILOT_LAST),
+      no: 0,                                    // assigned below, uniquely
+      orb: o,
+      M0: rr(0, 0.34),                          // they do not start together
+      dv: rr(0.32, 0.98),                       // fraction of budget remaining
+      dvRate: rr(0.02, 0.09),
+      trouble: rnd() < 0.22,
+      sig: rr(0.75, 1)
+    });
+  }
+
+  // race numbers, drawn without replacement — two craft carrying 54 is the
+  // kind of detail that quietly tells you the whole board is decorative
+  var pool = [];
+  for (i = 2; i <= 99; i++) pool.push(i);
+  for (i = 0; i < w.craft.length; i++) w.craft[i].no = pool.splice((rnd() * pool.length) | 0, 1)[0];
+
+  // ── the relay traffic. Not competitors: low, fast, and the reason the
+  //    circuit is legal at all. They also give the globe view something to do.
+  w.relays = [];
+  for (i = 0; i < 14; i++) {
+    var ra = rr(1.09, 1.42);
+    w.relays.push({
+      orb: prep({
+        a: ra, e: rr(0, 0.02),
+        i: rr(0, 99) * DEG, O: rr(0, 360) * DEG, w: rr(0, 360) * DEG,
+        P: LOOP / rr(5.5, 9.5)
+      }),
+      M0: rr(0, TAU),
+      id: 'R-' + ri(10, 99)
+    });
+  }
+
+  // ── the standings. Fixed per seed so the leaderboard does not shuffle every
+  //    frame; the live gap is computed, the season points are not.
+  w.season = [];
+  for (i = 0; i < nTeams; i++) w.season.push(ri(0, 240));
+
+  w.commentary = [
+    'RELAY HANDOVER NOMINAL',
+    'TRACK CLEAR THROUGH GATE 3',
+    'STEWARDS REVIEWING GATE 2 ENTRY',
+    'LUNAR WINDOW OPEN 00:41',
+    'DELTA-V AUDIT COMPLETE',
+    'SOLAR FLUX WITHIN LIMITS',
+    'TELEMETRY LOCK ON ALL CRAFT',
+    'GATE 4 MARSHALS ON STATION'
+  ];
+
+  w.moonPh = rr(0, TAU);
+  world = w;
+}
+
+// ───────────────────────────────────────────────────────────────────── 5. the lap
+//
+// One number runs the piece: the lap phase. It moves the Moon, it swings the
+// sun and so the terminator across the Earth, it advances every craft's mean
+// anomaly, it decides which gate is live, and it sets the scope's gain.
+//
+// The gain is the part worth explaining. A vector display shares one beam
+// between everything it draws, so the more vectors in a frame the less time
+// each one gets and the dimmer the whole picture becomes. Zoom out to the
+// system view and the tube has far more to trace, so it dims — not as an
+// effect, but because that is what the hardware did.
+
+var lap = {};
+function updateLap(u) {
+  lap.u = u;
+  lap.t = u * LOOP;
+
+  // the sun, and therefore the terminator
+  var sa = u * TAU;
+  lap.sun = { x: Math.cos(sa), y: Math.sin(sa) * 0.92, z: Math.sin(sa * 0.5) * 0.36 };
+  var sl = Math.sqrt(lap.sun.x * lap.sun.x + lap.sun.y * lap.sun.y + lap.sun.z * lap.sun.z);
+  lap.sun.x /= sl; lap.sun.y /= sl; lap.sun.z /= sl;
+
+  // the Moon, one circuit per lap — sport time, not sidereal time
+  var ma = world.moonPh + u * TAU;
+  lap.moon = {
+    x: D_MOON * Math.cos(ma),
+    y: D_MOON * Math.sin(ma) * Math.cos(5.14 * DEG),
+    z: D_MOON * Math.sin(ma) * Math.sin(5.14 * DEG)
+  };
+
+  // which gate is live, and how close the field is to it
+  var live = 0;
+  for (var i = 0; i < world.gates.length; i++) if (u >= world.gates[i].ph) live = i;
+  lap.gate = live;
+  var nxt = world.gates[(live + 1) % world.gates.length];
+  var span = (nxt.ph - world.gates[live].ph + 1) % 1 || 1;
+  lap.toGate = 1 - clamp((u - world.gates[live].ph + 1) % 1 / span, 0, 1);
+  lap.hot = Math.pow(1 - lap.toGate, 3);          // the display tightens at a gate
+
+  lap.lapNo = 3;
+  lap.laps = 8;
+}
+
+// ───────────────────────────────────────────────────────────────── 6. the camera
+
+var cam = { az: 0.55, el: 0.42, zoom: 0, tAz: 0.55, tEl: 0.42, tZoom: 0 };
+var CAM0 = { az: 0.55, el: 0.42, zoom: 0 };
+
+// zoom 0 is the globe, 1 is the whole Earth-Moon system, continuously.
+function viewR() { return lerp(1.55, 72, Math.pow(clamp(cam.zoom, 0, 1), 1.9)); }
+function camScale() { return Math.min(W, H) * 0.44 / viewR(); }
+
+var PROJ = { ca: 1, sa: 0, ce: 1, se: 0, S: 1 };
+var INSET = null;   // when set, px/py are centred on it instead of the Earth
+function setProj() {
+  PROJ.ca = Math.cos(cam.az); PROJ.sa = Math.sin(cam.az);
+  PROJ.ce = Math.cos(cam.el); PROJ.se = Math.sin(cam.el);
+  PROJ.S = camScale();
+}
+// orthographic, because a race chart is a chart
+function px(x, y, z) {
+  var X = x * PROJ.ca - y * PROJ.sa;
+  if (INSET) return INSET.cx + (X - INSET.ox) * PROJ.S;
+  return CX + X * PROJ.S;
+}
+function py(x, y, z) {
+  var Y = x * PROJ.sa + y * PROJ.ca;
+  var v = Y * PROJ.ce - z * PROJ.se;
+  if (INSET) return INSET.cy + (v - INSET.oy) * PROJ.S;
+  return CY + v * PROJ.S;
+}
+function pz(x, y, z) {                 // + is toward the viewer
+  var Y = x * PROJ.sa + y * PROJ.ca;
+  return Y * PROJ.se + z * PROJ.ce;
+}
+
+// ─────────────────────────────────────────────────────────── 7a. the Earth
+
+var TMP = [];
+function ringPts(ring, r, cull) {
+  var n = ring.length, o = 0;
+  if (TMP.length < n * 2) TMP = new Float32Array(n * 2 + 64);
+  for (var i = 0; i < n; i++) {
+    var p = sph(ring[i][0], ring[i][1], r);
+    var d = pz(p.x, p.y, p.z);
+    if (cull && d < -0.02) { TMP[o++] = NaN; TMP[o++] = NaN; continue; }
+    TMP[o++] = px(p.x, p.y, p.z);
+    TMP[o++] = py(p.x, p.y, p.z);
+  }
+  return TMP.subarray(0, o);
+}
+
+function sunLit(lon, lat) {
+  var p = sph(lon, lat, 1);
+  return p.x * lap.sun.x + p.y * lap.sun.y + p.z * lap.sun.z;
+}
+
+function drawEarth(g, k, T, boot) {
+  var S = Math.max(PROJ.S, 2.2);
+  var near = clamp(1 - cam.zoom * 2.2, 0, 1);         // detail fades on zoom out
+  var gain = lap.gain * boot;
+  var i, j;
+
+  // the bearing rim: where the off-tube field is reported. Drawn before the
+  // Earth so the planet sits inside its own instrument.
+  if (k === 'a') {
+    var Rl = Math.min(W, H) * 0.455, rim = [], q;
+    for (q = 0; q <= 180; q++) {
+      var rt = q / 180 * TAU;
+      rim.push(CX + Math.cos(rt) * Rl, CY + Math.sin(rt) * Rl);
+    }
+    beam(g, k, rim, gain * 0.16, 0.7, true);
+    for (q = 0; q < 36; q++) {
+      var tt = q / 36 * TAU;
+      var maj = q % 3 === 0;
+      var l0 = Rl - (maj ? GU * 0.5 : GU * 0.22);
+      beam(g, k, [CX + Math.cos(tt) * l0, CY + Math.sin(tt) * l0,
+                  CX + Math.cos(tt) * Rl, CY + Math.sin(tt) * Rl], gain * (maj ? 0.34 : 0.18), 0.8);
+    }
+  }
+
+  // the limb, which is the one place the beam actually turns and so the one
+  // place the Earth is bright
+  var lim = [];
+  for (i = 0; i <= 96; i++) {
+    var th = i / 96 * TAU;
+    lim.push(CX + Math.cos(th) * S, CY + Math.sin(th) * S);
+  }
+  beam(g, k, lim, gain * (k === 'a' ? 0.85 : k === 'g' ? 0.5 : 0.18), 1.2, true);
+
+  // graticule — every 30 degrees, back face culled
+  var gg = gain * (k === 'a' ? 0.34 : k === 'g' ? 0.30 : 0.07) * (0.35 + near * 0.65);
+  if (gg > 0.01) {
+    for (i = -76; i <= 76; i += 38) {
+      var ring = [];
+      for (j = 0; j <= 64; j++) ring.push([j / 64 * 360 - 180, i]);
+      beam(g, k, ringPts(ring, 1, true), gg * (i === 0 ? 1.6 : 1), i === 0 ? 1.0 : 0.8);
+    }
+    for (i = 0; i < 180; i += 30) {
+      var mer = [];
+      for (j = 0; j <= 48; j++) mer.push([i, -76 + j / 48 * 152]);
+      beam(g, k, ringPts(mer, 1, true), gg, 0.8);
+    }
+  }
+
+  // coasts, lit by the sun. The night side is not black — a scope has no black
+  // to draw with, only less beam — so it is the same trace at lower gain.
+  if (near > 0.02) {
+    for (i = 0; i < COASTS.length; i++) {
+      var ring2 = COASTS[i];
+      var pts = ringPts(ring2, 1.002, true);
+      // one lit test per ring is enough at this scale, taken at its middle
+      var mid = ring2[(ring2.length / 2) | 0];
+      var lit = sstep(-0.35, 0.22, sunLit(mid[0], mid[1]));
+      var ca = gain * near * (k === 'a' ? 0.62 : k === 'g' ? 0.78 : 0.16) * (0.22 + lit * 0.78);
+      beam(g, k, pts, ca, 1.0);
+    }
+  }
+
+  // the terminator, drawn as the great circle perpendicular to the sun
+  if (near > 0.05 && k !== 'r') {
+    var s = lap.sun;
+    var ux = -s.y, uy = s.x, uz = 0;
+    var ul = Math.sqrt(ux * ux + uy * uy) || 1;
+    ux /= ul; uy /= ul;
+    var vx = s.y * uz - s.z * uy, vy = s.z * ux - s.x * uz, vz = s.x * uy - s.y * ux;
+    var term = [];
+    for (i = 0; i <= 72; i++) {
+      var a2 = i / 72 * TAU, c2 = Math.cos(a2), s2 = Math.sin(a2);
+      var X = ux * c2 + vx * s2, Y = uy * c2 + vy * s2, Z = uz * c2 + vz * s2;
+      if (pz(X, Y, Z) < -0.02) { term.push(NaN, NaN); continue; }
+      term.push(px(X, Y, Z), py(X, Y, Z));
+    }
+    beam(g, k, term, gain * near * (k === 'a' ? 0.30 : 0.42), 0.9);
+  }
+
+  // stations, and the relay arcs up to whatever is overhead
+  if (near > 0.25) {
+    for (i = 0; i < STATIONS.length; i++) {
+      var st = STATIONS[i];
+      var sp = sph(st[1], st[2], 1.004);
+      if (pz(sp.x, sp.y, sp.z) < 0) continue;
+      var sx = px(sp.x, sp.y, sp.z), sy = py(sp.x, sp.y, sp.z);
+      var lit2 = sstep(-0.3, 0.3, sunLit(st[1], st[2]));
+      var sa2 = gain * near * (k === 'a' ? 0.7 : k === 'g' ? 0.45 : 0.1) * (0.45 + lit2 * 0.55);
+      spot(g, k, sx, sy, GU * 0.42, sa2 * 0.55);
+      if (k === 'a' && !compact && near > 0.7) {
+        txt(g, k, st[0], sx + GU * 0.5, sy - GU * 0.28, 5.6, { a: sa2 * 0.55, track: 0.7 });
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────── 7b. the Moon
+
+function drawMoon(g, k, T, boot) {
+  var m = lap.moon, S = PROJ.S;
+  var r = R_MOON * S;
+  var mx = px(m.x, m.y, m.z), my = py(m.x, m.y, m.z);
+  var gain = lap.gain * boot;
+  var i, j;
+
+  // its orbit, which is the outer boundary of the whole sport
+  if (cam.zoom > 0.12 && k !== 'r') {
+    var orb = [];
+    for (i = 0; i <= 128; i++) {
+      var a2 = i / 128 * TAU;
+      var X = D_MOON * Math.cos(a2);
+      var Y = D_MOON * Math.sin(a2) * Math.cos(5.14 * DEG);
+      var Z = D_MOON * Math.sin(a2) * Math.sin(5.14 * DEG);
+      orb.push(px(X, Y, Z), py(X, Y, Z));
+    }
+    beam(g, k, orb, gain * (k === 'a' ? 0.16 : 0.22) * sstep(0.12, 0.4, cam.zoom), 0.7, true);
+  }
+
+  if (r < 1.2) { spot(g, k, mx, my, GU * 0.5, gain * (k === 'g' ? 0.5 : 0.3)); return; }
+
+  // the limb
+  var lim = [];
+  for (i = 0; i <= 72; i++) {
+    var th = i / 72 * TAU;
+    lim.push(mx + Math.cos(th) * r, my + Math.sin(th) * r);
+  }
+  beam(g, k, lim, gain * (k === 'a' ? 0.5 : k === 'g' ? 0.75 : 0.22), 1.1, true);
+
+  // craters, as rings. A scope cannot shade a sphere, so the only way to say
+  // "this is a body and not a circle" is to put something on it.
+  if (r > 7) {
+    var rr2 = mulberry32(SEED ^ 0x3C7A);
+    for (i = 0; i < 16; i++) {
+      var cu = rr2() * TAU, cv = Math.acos(rr2() * 2 - 1);
+      var cr = (0.06 + rr2() * 0.2);
+      var nx = Math.sin(cv) * Math.cos(cu), ny = Math.sin(cv) * Math.sin(cu), nz = Math.cos(cv);
+      // only the near face
+      var d = pz(nx, ny, nz);
+      if (d < 0.12) continue;
+      var ring = [];
+      for (j = 0; j <= 18; j++) {
+        var a3 = j / 18 * TAU;
+        ring.push(mx + (nx * 0 + Math.cos(a3) * cr) * r * 0.98,
+                  my + (Math.sin(a3) * cr * (0.4 + d * 0.6)) * r * 0.98);
+      }
+      // place the ring at the crater, not at the centre
+      var ox = px(m.x + nx * R_MOON, m.y + ny * R_MOON, m.z + nz * R_MOON) - mx;
+      var oy = py(m.x + nx * R_MOON, m.y + ny * R_MOON, m.z + nz * R_MOON) - my;
+      for (j = 0; j < ring.length; j += 2) { ring[j] += ox * 0.92; ring[j + 1] += oy * 0.92; }
+      beam(g, k, ring, gain * (k === 'g' ? 0.30 : 0.14) * d, 0.7, true);
+    }
+  }
+
+  if (k === 'a' && !compact) {
+    txt(g, k, 'LUNA', mx + r + GU * 0.5, my - r * 0.5, 6.4, { a: gain * 0.7, track: 1.6 });
+  }
+}
+
+// ───────────────────────────────────────────── 7c. the orbits and the field
+
+function craftM(c) { return c.orb.n * lap.t + c.M0 * TAU; }
+
+// An orbit, sampled in EQUAL TIME rather than equal angle. That is the whole
+// point: equal time means the samples crowd at apogee where the craft is slow,
+// so the trace blooms exactly where the sport is named for, with nobody having
+// written a brightness term.
+var ORBN = 220;
+var obuf = new Float32Array(ORBN * 2 + 2);
+function orbitTrace(o, M0, n) {
+  n = n || ORBN;
+  for (var i = 0; i <= n; i++) {
+    var M = M0 + i / n * TAU;
+    var p = orbitAt(o, M);
+    obuf[i * 2] = px(p.x, p.y, p.z);
+    obuf[i * 2 + 1] = py(p.x, p.y, p.z);
+  }
+  return obuf.subarray(0, (n + 1) * 2);
+}
+
+var tbuf = new Float32Array(120);
+function drawField(g, k, T, boot) {
+  var C = world.craft, i, j;
+  var gain = lap.gain * boot;
+  var Rlimb = Math.min(W, H) * 0.455;
+
+  for (i = 0; i < C.length; i++) {
+    var c = C[i];
+    var mix = c.mix[k];
+    var M = craftM(c);
+    var isLock = lockIdx === i, isHover = hoverIdx === i;
+
+    var p0 = orbitAt(c.orb, M);
+    var cx0 = px(p0.x, p0.y, p0.z), cy0 = py(p0.x, p0.y, p0.z);
+    c._x = cx0; c._y = cy0;
+    var rFromC = Math.sqrt((cx0 - CX) * (cx0 - CX) + (cy0 - CY) * (cy0 - CY));
+    var onTube = rFromC < Rlimb && cx0 > 0 && cx0 < W && cy0 > 0 && cy0 < H;
+
+    // the filed trajectory
+    var og = gain * mix * (0.19 + (isLock ? 0.42 : isHover ? 0.20 : 0)) * (c.trouble ? 0.65 : 1);
+    if (og > 0.008) beam(g, k, orbitTrace(c.orb, M, isLock ? 220 : 120), og, 0.7);
+
+    // The tail, sampled backward in equal time so it stretches where the craft
+    // is fast. It decays toward the green-yellow gun because that is what P7
+    // does, so age reads as hue and team reads as mix, in one mark.
+    var NT = 26;
+    for (j = 0; j <= NT; j++) {
+      var dt = j / NT * 2.6;
+      var p2 = orbitAt(c.orb, M - c.orb.n * dt);
+      tbuf[j * 2] = px(p2.x, p2.y, p2.z);
+      tbuf[j * 2 + 1] = py(p2.x, p2.y, p2.z);
+    }
+    var decayMix = lerp(mix, k === 'g' ? 1 : 0.12, 0.72);
+    beam(g, k, tbuf.subarray(0, 12), gain * mix * 1.35 * c.sig, 1.5);
+    beam(g, k, tbuf.subarray(8, 34), gain * lerp(mix, decayMix, 0.5) * 0.72 * c.sig, 1.1);
+    beam(g, k, tbuf.subarray(30, (NT + 1) * 2), gain * decayMix * 0.38 * c.sig, 0.8);
+
+    var bright = gain * mix * (isLock ? 1.7 : isHover ? 1.3 : 1) * c.sig;
+    spot(g, k, cx0, cy0, GU * (isLock ? 0.95 : 0.66), bright * 1.05);
+
+    if ((isLock || isHover) && onTube) {
+      var rb = GU * (isLock ? 1.5 : 1.1);
+      beam(g, k, [cx0 - rb, cy0 - rb, cx0 + rb, cy0 - rb, cx0 + rb, cy0 + rb, cx0 - rb, cy0 + rb],
+           gain * mix * 1.3, 1.0, true);
+    }
+
+    // the callout, staggered by running order so six of them do not stack
+    if (onTube && !compact && (bright > 0.16 || isLock) && (k === 'a' || mix > 0.5)) {
+      var slot = (lap.order ? lap.order.findIndex(function (o) { return o.i === i; }) : i);
+      var lx = gx(cx0 + GU * 1.2), ly = gx(cy0 - GU * (1.1 + (slot % 3) * 0.85));
+      txt(g, k, String(c.no).padStart(2, '0') + '  ' + c.team,
+          lx, ly, 6.4, { a: gain * mix * (isLock ? 1 : 0.66), track: 1.1 });
+      if (isLock || isHover) {
+        var rad = Math.sqrt(p0.x * p0.x + p0.y * p0.y + p0.z * p0.z);
+        txt(g, k, 'DV ' + (c.dv * 100).toFixed(0) + '%   ' + rad.toFixed(2) + ' RE',
+            lx, ly + GU * 0.9, 5.8, { a: gain * mix * 0.62, track: 0.8 });
+      }
+    }
+
+    // Off the tube: a bearing tick on the rim, pointing where it went. Five of
+    // six craft are off-screen at globe zoom and this is the only reason the
+    // board and the picture agree with each other there.
+    if (!onTube && mix > 0.06) {
+      var ang = Math.atan2(cy0 - CY, cx0 - CX);
+      var ca = Math.cos(ang), sa = Math.sin(ang);
+      var nx = -sa, ny = ca;
+      var r0 = Rlimb - GU * 0.55, r1 = Rlimb + GU * 0.75;
+      // the tick
+      beam(g, k, [CX + ca * r0, CY + sa * r0, CX + ca * r1, CY + sa * r1], gain * mix * 1.5, 2.6);
+      // an outward chevron, so it reads as a direction and not as a stray vector
+      var tipX = CX + ca * (r1 + GU * 0.45), tipY = CY + sa * (r1 + GU * 0.45);
+      beam(g, k, [CX + ca * r1 + nx * GU * 0.34, CY + sa * r1 + ny * GU * 0.34,
+                  tipX, tipY,
+                  CX + ca * r1 - nx * GU * 0.34, CY + sa * r1 - ny * GU * 0.34],
+           gain * mix * 1.2, 1.6);
+      if (k === 'a' || mix > 0.5) {
+        var rad2 = Math.sqrt(p0.x * p0.x + p0.y * p0.y + p0.z * p0.z);
+        var lrx = clamp(CX + ca * (Rlimb + GU * 2.1), GU * 2, W - GU * 2);
+        var lry = clamp(CY + sa * (Rlimb + GU * 2.1), GU * 2.4, H - GU * 2.4);
+        txt(g, k, String(c.no).padStart(2, '0'), lrx, lry + GU * 0.15, 6.6,
+            { a: gain * mix * 0.95, align: 'center', track: 0.6, w: '600' });
+        if (!compact) {
+          txt(g, k, rad2.toFixed(0) + ' RE', lrx, lry + GU * 1.0, 5.2,
+              { a: gain * mix * 0.5, align: 'center', track: 0.5 });
+        }
+      }
+    }
+  }
+
+  // relay traffic, only when the globe is worth looking at
+  if (cam.zoom < 0.45) {
+    var rg = gain * (k === 'g' ? 0.40 : k === 'a' ? 0.26 : 0.06) * (1 - cam.zoom / 0.45);
+    for (i = 0; i < world.relays.length; i++) {
+      var rl = world.relays[i];
+      var RM = rl.orb.n * lap.t + rl.M0;
+      beam(g, k, orbitTrace(rl.orb, RM, 56), rg * 0.34, 0.6, true);
+      var rp = orbitAt(rl.orb, RM);
+      spot(g, k, px(rp.x, rp.y, rp.z), py(rp.x, rp.y, rp.z), GU * 0.3, rg * 0.8);
+    }
+  }
+}
+
+function drawGates(g, k, T, boot) {
+  var G = world.gates, gain = lap.gain * boot, i, j;
+  for (i = 0; i < G.length; i++) {
+    var ga = G[i];
+    var live = i === lap.gate;
+    var d = Math.sqrt(ga.x * ga.x + ga.y * ga.y + ga.z * ga.z);
+    // a gate only reads at a zoom where it is not a dot or the whole screen
+    var rr2 = ga.rad * PROJ.S;
+    if (rr2 < 1.5 || rr2 > Math.max(W, H)) continue;
+    var gx2 = px(ga.x, ga.y, ga.z), gy2 = py(ga.x, ga.y, ga.z);
+    var a = gain * (live ? (0.62 + lap.hot * 0.38) : 0.20) *
+            (k === 'a' ? 1 : k === 'g' ? 0.5 : live ? 0.85 : 0.12);
+    if (a < 0.01) continue;
+
+    // a torus read edge-on: two rings at right angles, which is how you draw a
+    // hoop in space when you have no fill
+    for (j = 0; j < 2; j++) {
+      var ring = [];
+      for (var q = 0; q <= 40; q++) {
+        var th = q / 40 * TAU;
+        var ax = Math.cos(th) * ga.rad, ay = Math.sin(th) * ga.rad * (j ? 0.2 : 1);
+        var cz = j ? Math.sin(th) * ga.rad * 0.98 : 0;
+        var X = ga.x + ax * Math.cos(ga.tilt) - ay * Math.sin(ga.tilt);
+        var Y = ga.y + ax * Math.sin(ga.tilt) + ay * Math.cos(ga.tilt);
+        ring.push(px(X, Y, ga.z + cz), py(X, Y, ga.z + cz));
+      }
+      beam(g, k, ring, a * (j ? 0.5 : 1), live ? 1.2 : 0.8, true);
+    }
+    if (k === 'a' && !compact && rr2 > GU &&
+        gx2 > -GU && gx2 < W + GU * 8 && gy2 > GU && gy2 < H - GU) {
+      txt(g, k, ga.name, gx2 + rr2 * 0.7 + GU * 0.4, gy2 - GU * 0.4, 6, { a: a * 0.8, track: 1.2 });
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────── 7d. the broadcast
+//
+// The reference reading for this one was sports graphics, not instruments, and
+// it pulls the opposite way from the survey console: a viewer should read a
+// broadcast graphic in about two seconds. So this is deliberately sparse where
+// Parallax is dense. Position, team, gap. Everything else earns its place.
+
+var FONT = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace';
+var hasTrack = (function () { try { return 'letterSpacing' in out; } catch (e) { return false; } })();
+
+// Type on a vector scope is also beam work, but character outlines would cost
+// more than the rest of the frame put together, so this is the one honest
+// compromise in the file: fillText, drawn with the same additive gun.
+function txt(g, k, s, x, y, size, o) {
+  o = o || {};
+  var a = o.a === undefined ? 0.8 : o.a;
+  if (a < 0.006) return 0;
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = 'rgba(' + GUN[k] + ',' + Math.min(1, a) + ')';
+  g.font = (o.w || '400') + ' ' + Math.max(6, Math.round(size * SCALE)) + 'px ' + FONT;
+  g.textAlign = o.align || 'left';
+  g.textBaseline = o.base || 'alphabetic';
+  if (hasTrack) g.letterSpacing = (o.track === undefined ? 1.1 : o.track) * SCALE + 'px';
+  g.fillText(s, x, y);
+  var wd = g.measureText(s).width;
+  if (hasTrack) g.letterSpacing = '0px';
+  g.globalCompositeOperation = 'source-over';
+  return wd;
+}
+
+function rule(g, k, x1, y, x2, a) {
+  if (a < 0.006) return;
+  beam(g, k, [x1, Math.round(y) + 0.5, x2, Math.round(y) + 0.5], a, 0.8);
+}
+
+// standings: by how far round the lap each craft is
+function standings() {
+  var C = world.craft, arr = [];
+  for (var i = 0; i < C.length; i++) {
+    var M = craftM(C[i]);
+    arr.push({ i: i, prog: M / TAU });
+  }
+  arr.sort(function (a, b) { return b.prog - a.prog; });
+  return arr;
+}
+
+function drawBoard(g, k, T, boot) {
+  var pad = gx(GU * 1.8);
+  var a0 = boot;
+  var ord = lap.order, i;
+
+  if (k === 'a') {
+    txt(g, k, 'APOGEE', pad, gx(GU * 2.6), 14, { a: a0 * 0.95, track: 5.0, w: '600' });
+    txt(g, k, 'CISLUNAR CIRCUIT · ROUND ' + (SEED % 9 + 1), pad, gx(GU * 3.8), 6.6,
+        { a: a0 * 0.42, track: 2.0 });
+    rule(g, k, pad, gx(GU * 4.4), pad + GU * 15, a0 * 0.4);
+  }
+
+  // ── the leaderboard. Six rows, and the only thing that has to read in two
+  //    seconds: position, number, team, gap.
+  var ly = gx(GU * 6.4), rowH = GU * 1.9;
+  if (k === 'a' && !compact) {
+    txt(g, k, 'POS', pad, ly - GU * 0.8, 5.6, { a: a0 * 0.4, track: 1.2 });
+    txt(g, k, 'GAP', pad + GU * 12.6, ly - GU * 0.8, 5.6, { a: a0 * 0.4, track: 1.2, align: 'right' });
+  }
+
+  var leadProg = ord.length ? ord[0].prog : 0;
+  for (i = 0; i < ord.length; i++) {
+    var c = world.craft[ord[i].i];
+    var mix = c.mix[k];
+    var y = ly + i * rowH;
+    var isLock = lockIdx === ord[i].i;
+    var a = a0 * (0.5 + mix * 0.5) * (isLock ? 1 : 0.86);
+
+    // the team's colour bar — the fastest read on the board
+    if (mix > 0.05) {
+      beam(g, k, [pad - GU * 0.55, y - GU * 0.55, pad - GU * 0.55, y + GU * 0.4],
+           a0 * mix * 1.4, 2.4);
+    }
+    if (k !== 'a' && mix < 0.4) continue;
+
+    var ta = a0 * (k === 'a' ? 1 : mix);
+    txt(g, k, String(i + 1), pad, y, 9, { a: ta * (isLock ? 1 : 0.8), w: '600', track: 1.0 });
+    txt(g, k, String(c.no).padStart(2, '0'), pad + GU * 1.5, y, 7.4, { a: ta * 0.75, track: 0.9 });
+    if (!compact) {
+      txt(g, k, c.team, pad + GU * 3.2, y, 7.0, { a: ta * (isLock ? 1 : 0.72), track: 1.0 });
+      var gap = i === 0 ? 'LEADER' : '+' + ((leadProg - ord[i].prog) * LOOP).toFixed(2);
+      txt(g, k, gap, pad + GU * 12.6, y, 6.6,
+          { a: ta * (i === 0 ? 0.9 : 0.62), align: 'right', track: 0.6 });
+    }
+
+    // delta-v remaining: the resource that decides the sport, so it gets a bar
+    if (k === 'r' || k === 'a') {
+      var bw = GU * 4.2, bx = pad + GU * 1.5, by = y + GU * 0.52;
+      var low = c.dv < 0.25;
+      var ba = a0 * (low ? (k === 'r' ? 1 : 0.3) : (k === 'a' ? 0.34 : 0.1));
+      if (ba > 0.01) {
+        beam(g, k, [bx, by, bx + bw, by], ba * 0.30, 1.0);
+        beam(g, k, [bx, by, bx + bw * c.dv, by], ba * (low ? 1.1 : 0.8), 1.6);
+      }
+    }
+    if (c.trouble && k === 'r') {
+      txt(g, k, '▲', pad + GU * 11.4, y, 6.4, { a: a0 * (0.4 + 0.6 * Math.abs(Math.sin(T * TAU / BLINK_P))) });
+    }
+  }
+
+  if (k !== 'a') return;
+
+  // ── race state, top right. Clock, lap, live gate.
+  var rx = W - pad;
+  var rt = lap.u * 47 * 60 + lap.lapNo * 47 * 60;
+  var hh = ((rt / 3600) | 0), mm = ((rt / 60) | 0) % 60, ss = (rt | 0) % 60;
+  txt(g, k, 'T+' + String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') + ':' + String(ss).padStart(2, '0'),
+      rx, gx(GU * 2.7), 11, { a: a0 * 0.92, align: 'right', track: 1.6, w: '600' });
+  txt(g, k, 'LAP ' + lap.lapNo + ' / ' + lap.laps, rx, gx(GU * 4.0), 7.4,
+      { a: a0 * 0.6, align: 'right', track: 1.4 });
+
+  var liveGate = world.gates[lap.gate];
+  txt(g, k, liveGate.name, rx, gx(GU * 5.6), 7.0,
+      { a: a0 * (0.5 + lap.hot * 0.5), align: 'right', track: 1.2 });
+  // the approach bar
+  var abw = GU * 9;
+  beam(g, k, [rx - abw, gx(GU * 6.2), rx, gx(GU * 6.2)], a0 * 0.22, 1.0);
+  beam(g, k, [rx - abw, gx(GU * 6.2), rx - abw + abw * (1 - lap.toGate), gx(GU * 6.2)],
+       a0 * (0.5 + lap.hot * 0.5), 1.8);
+
+  // ── the scale bar, in Earth radii, because that is the unit the sport uses
+  var S = PROJ.S;
+  var unit = cam.zoom < 0.25 ? 1 : cam.zoom < 0.6 ? 10 : 30;
+  var unitLabel = unit === 1 ? '1 EARTH RADIUS' : unit + ' EARTH RADII';
+  var bw2 = unit * S;
+  if (bw2 > GU * 2 && bw2 < W * 0.5) {
+    var bx2 = CX - bw2 / 2, by2 = H - gx(GU * 2.2);
+    beam(g, k, [bx2, by2, bx2 + bw2, by2], a0 * 0.45, 1.0);
+    beam(g, k, [bx2, by2 - GU * 0.3, bx2, by2 + GU * 0.3], a0 * 0.45, 1.0);
+    beam(g, k, [bx2 + bw2, by2 - GU * 0.3, bx2 + bw2, by2 + GU * 0.3], a0 * 0.45, 1.0);
+    txt(g, k, unitLabel, CX, by2 - GU * 0.55, 6, { a: a0 * 0.55, align: 'center', track: 1.4 });
+  }
+
+  // ── commentary, bottom left. One line, changing on the tick.
+  if (!compact) {
+    var ci2 = Math.floor(T / (LOOP / 8)) % world.commentary.length;
+    var fade = sstep(0, 0.12, fract(T / (LOOP / 8))) * (1 - sstep(0.88, 1, fract(T / (LOOP / 8))));
+    txt(g, k, world.commentary[ci2], pad, H - gx(GU * 1.9), 6.4, { a: a0 * 0.42 * fade, track: 1.3 });
+  }
+
+  // frame corners — a broadcast safe area
+  var m = gx(GU * 1.1), L = GU * 2;
+  var ca2 = a0 * 0.22;
+  beam(g, k, [m, m + L, m, m, m + L, m], ca2, 1.0);
+  beam(g, k, [W - m - L, m, W - m, m, W - m, m + L], ca2, 1.0);
+  beam(g, k, [W - m, H - m - L, W - m, H - m, W - m - L, H - m], ca2, 1.0);
+  beam(g, k, [m + L, H - m, m, H - m, m, H - m - L], ca2, 1.0);
+}
+
+function drawReticle(g, k, T, boot) {
+  if (k !== 'a' || STILL || !pointerIn) return;
+  var a = 0.45 * boot, x = ptr.x, y = ptr.y, r = GU * 0.9;
+  beam(g, k, [x - r * 2, y, x - r * 0.6, y], a, 0.9);
+  beam(g, k, [x + r * 0.6, y, x + r * 2, y], a, 0.9);
+  beam(g, k, [x, y - r * 2, x, y - r * 0.6], a, 0.9);
+  beam(g, k, [x, y + r * 0.6, x, y + r * 2], a, 0.9);
+}
+
+// ───────────────────────────────────────────────────────── 7e. the lunar inset
+
+function drawInset(g, k, T, boot) {
+  if (compact) return;
+  var w = GU * 15, h = GU * 11;
+  var x0 = gx(W - GU * 2 - w), y0 = gx(H - GU * 3.4 - h);
+  var gain = lap.gain * boot;
+  var i, j;
+
+  // the frame: corner marks, never a box
+  var L = GU * 1.1, fa = gain * (k === 'a' ? 0.34 : 0.10);
+  beam(g, k, [x0, y0 + L, x0, y0, x0 + L, y0], fa, 1.0);
+  beam(g, k, [x0 + w - L, y0, x0 + w, y0, x0 + w, y0 + L], fa, 1.0);
+  beam(g, k, [x0 + w, y0 + h - L, x0 + w, y0 + h, x0 + w - L, y0 + h], fa, 1.0);
+  beam(g, k, [x0 + L, y0 + h, x0, y0 + h, x0, y0 + h - L], fa, 1.0);
+
+  if (k === 'a') {
+    txt(g, k, 'THE TURN \u00b7 LUNAR', x0, y0 - GU * 0.5, 6.2, { a: gain * 0.55, track: 1.6 });
+  }
+
+  // point the projection at the Moon and give it a scale of its own
+  var m = lap.moon;
+  var savedS = PROJ.S;
+  var mS = Math.min(w, h) * 0.30 / R_MOON;
+  PROJ.S = mS;
+  var MX = m.x * PROJ.ca - m.y * PROJ.sa;
+  var MY = m.x * PROJ.sa + m.y * PROJ.ca;
+  INSET = { cx: x0 + w * 0.5, cy: y0 + h * 0.5, ox: MX, oy: MY * PROJ.ce - m.z * PROJ.se };
+
+  g.save();
+  g.beginPath();
+  g.rect(x0 + 1, y0 + 1, w - 2, h - 2);
+  g.clip();
+
+  // the Moon's limb and craters, at a size where they mean something
+  var mx = px(m.x, m.y, m.z), my = py(m.x, m.y, m.z), r = R_MOON * mS;
+  var lim = [];
+  for (i = 0; i <= 80; i++) {
+    var th = i / 80 * TAU;
+    lim.push(mx + Math.cos(th) * r, my + Math.sin(th) * r);
+  }
+  beam(g, k, lim, gain * (k === 'a' ? 0.60 : k === 'g' ? 0.90 : 0.24), 1.2, true);
+
+  var rr2 = mulberry32(SEED ^ 0x3C7A);
+  for (i = 0; i < 22; i++) {
+    var cu = rr2() * TAU, cv = Math.acos(rr2() * 2 - 1), cr = 0.05 + rr2() * 0.19;
+    var nx = Math.sin(cv) * Math.cos(cu), ny = Math.sin(cv) * Math.sin(cu), nz = Math.cos(cv);
+    var d = pz(nx, ny, nz);
+    if (d < 0.14) continue;
+    var ox = px(m.x + nx * R_MOON, m.y + ny * R_MOON, m.z + nz * R_MOON);
+    var oy = py(m.x + nx * R_MOON, m.y + ny * R_MOON, m.z + nz * R_MOON);
+    var ring = [];
+    for (j = 0; j <= 20; j++) {
+      var a3 = j / 20 * TAU;
+      ring.push(ox + Math.cos(a3) * cr * r, oy + Math.sin(a3) * cr * r * (0.35 + d * 0.65));
+    }
+    beam(g, k, ring, gain * (k === 'g' ? 0.40 : 0.18) * d, 0.7, true);
+  }
+
+  // the lunar gate, which is the whole reason this panel exists
+  var lg = world.gates[3];
+  var live = lap.gate === 3;
+  var ga = gain * (live ? 0.9 + lap.hot * 0.5 : 0.34) * (k === 'a' ? 1 : k === 'g' ? 0.5 : live ? 0.9 : 0.14);
+  for (j = 0; j < 2; j++) {
+    var gr = [];
+    for (i = 0; i <= 44; i++) {
+      var th2 = i / 44 * TAU;
+      var ax = Math.cos(th2) * 0.62, ay = Math.sin(th2) * 0.62 * (j ? 0.2 : 1);
+      var cz = j ? Math.sin(th2) * 0.62 * 0.98 : 0;
+      var X = lg.x + ax * Math.cos(lg.tilt) - ay * Math.sin(lg.tilt);
+      var Y = lg.y + ax * Math.sin(lg.tilt) + ay * Math.cos(lg.tilt);
+      gr.push(px(X, Y, lg.z + cz), py(X, Y, lg.z + cz));
+    }
+    beam(g, k, gr, ga * (j ? 0.5 : 1), live ? 1.3 : 0.9, true);
+  }
+
+  // whoever is out here, with their tail
+  for (i = 0; i < world.craft.length; i++) {
+    var c = world.craft[i];
+    var mix = c.mix[k];
+    if (mix < 0.05) continue;
+    var M = craftM(c);
+    var NT = 18;
+    for (j = 0; j <= NT; j++) {
+      var p2 = orbitAt(c.orb, M - c.orb.n * (j / NT * 3.4));
+      tbuf[j * 2] = px(p2.x, p2.y, p2.z);
+      tbuf[j * 2 + 1] = py(p2.x, p2.y, p2.z);
+    }
+    var cx = tbuf[0], cy = tbuf[1];
+    if (cx < x0 - w || cx > x0 + w * 2 || cy < y0 - h || cy > y0 + h * 2) continue;
+    beam(g, k, tbuf.subarray(0, 14), gain * mix * 1.2, 1.3);
+    beam(g, k, tbuf.subarray(10, (NT + 1) * 2), gain * mix * 0.4, 0.9);
+    spot(g, k, cx, cy, GU * 0.5, gain * mix * 1.0);
+    if (k === 'a' || mix > 0.5) {
+      txt(g, k, String(c.no).padStart(2, '0'), cx + GU * 0.6, cy - GU * 0.3, 5.8,
+          { a: gain * mix * 0.8, track: 0.6 });
+    }
+  }
+
+  g.restore();
+  INSET = null;
+  PROJ.S = savedS;
+
+  // the range back to Earth, which is the number that makes the inset mean
+  // something rather than just being a second picture
+  if (k === 'a') {
+    var d2 = Math.sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
+    txt(g, k, d2.toFixed(1) + ' RE FROM EARTH', x0 + w, y0 + h + GU * 0.85, 5.8,
+        { a: gain * 0.45, align: 'right', track: 0.9 });
+  }
+}
+
+// ────────────────────────────────────────────────────────────────── 8. the screen
+//
+// A vector tube has no scanlines — there is no scan. What it has is bloom where
+// the beam dwelt, a little flicker from the refresh, and glass.
+
+function composite(T) {
+  out.setTransform(1, 0, 0, 1, 0, 0);
+  out.globalCompositeOperation = 'source-over';
+  out.globalAlpha = 1;
+  out.fillStyle = TUBE;
+  out.fillRect(0, 0, W, H);
+
+  // the guns are not perfectly converged
+  out.globalCompositeOperation = 'lighter';
+  var REG = { a: [0, 0], g: [0.7, -0.4], r: [-0.65, 0.45] };
+  for (var i = 0; i < 3; i++) {
+    var k = GUNS[i], r = REG[k];
+    var drift = 0.6 + 0.4 * Math.sin(T * TAU / LOOP + i * 2.1);
+    out.drawImage(buf[k].c, r[0] * drift * SCALE, r[1] * drift * SCALE);
+  }
+
+  // bloom. On a scope this is most of what you actually see.
+  bloomG.globalCompositeOperation = 'source-over';
+  bloomG.drawImage(view, 0, 0, bloomC.width, bloomC.height);
+  bloomSG.globalCompositeOperation = 'source-over';
+  bloomSG.drawImage(bloomC, 0, 0, bloomS.width, bloomS.height);
+  out.globalCompositeOperation = 'lighter';
+  out.globalAlpha = 0.40;
+  out.drawImage(bloomC, 0, 0, W, H);
+  out.globalAlpha = 0.34;
+  out.drawImage(bloomS, 0, 0, W, H);
+  out.globalAlpha = 1;
+
+  // refresh flicker — deterministic from the frame number
+  var fN = Math.round(T * FPS);
+  var fl = 0.972 + 0.028 * Math.sin(fN * 2.21) * Math.sin(fN * 0.37);
+  out.globalCompositeOperation = 'multiply';
+  out.fillStyle = 'rgba(255,255,255,1)';
+  out.globalAlpha = 1;
+  var vg = out.createRadialGradient(CX, CY * 0.97, Math.min(W, H) * 0.28, CX, CY, Math.max(W, H) * 0.78);
+  vg.addColorStop(0, 'rgba(255,255,255,' + fl + ')');
+  vg.addColorStop(0.7, 'rgba(206,214,222,' + fl + ')');
+  vg.addColorStop(1, 'rgba(96,108,120,' + fl + ')');
+  out.fillStyle = vg;
+  out.fillRect(0, 0, W, H);
+
+  // the glass itself: a faint sheen, and the green cast of an unlit phosphor
+  out.globalCompositeOperation = 'lighter';
+  var sg = out.createLinearGradient(0, 0, W * 0.55, H);
+  sg.addColorStop(0, 'rgba(90,150,130,0.040)');
+  sg.addColorStop(0.5, 'rgba(0,0,0,0)');
+  out.fillStyle = sg;
+  out.fillRect(0, 0, W, H);
+  out.globalCompositeOperation = 'source-over';
+}
+
+// ───────────────────────────────────────────────────────────────────── 9. a frame
+
+var hoverIdx = -1, lockIdx = -1;
+var ptr = { x: 0, y: 0 }, pointerIn = false;
+var sess = 0;
+
+function render(T) {
+  updateLap(fract(T / LOOP));
+  setProj();
+  lap.order = standings();
+
+  // The scope's gain. One beam is shared by everything on screen, so the more
+  // there is to trace the less time each vector gets. Zoomed out there is far
+  // more to draw, so the picture dims — which is the hardware, not a look.
+  var load = 0.72 + cam.zoom * 0.42 + (cam.zoom < 0.45 ? 0.20 : 0);
+  lap.gain = clamp(1.45 / load, 0.62, 1.9) * (0.94 + lap.hot * 0.14);
+
+  var boot = DETERM ? 1 : sstep(0.15, 2.0, sess);
+
+  for (var i = 0; i < 3; i++) {
+    var k = GUNS[i], g = buf[k].g;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = 'source-over';
+    g.globalAlpha = 1;
+    g.fillStyle = '#000000';
+    g.fillRect(0, 0, W, H);
+
+    drawEarth(g, k, T, boot);
+    drawMoon(g, k, T, boot);
+    drawGates(g, k, T, boot);
+    drawField(g, k, T, boot);
+    drawInset(g, k, T, boot);
+    drawBoard(g, k, T, boot);
+    drawReticle(g, k, T, boot);
+  }
+
+  composite(T);
+  overlay(T);
+}
+
+var hudUntil = 10;
+function overlay(T) {
+  if (STILL) return;
+  var age = sess;
+  var titleA = sstep(0.3, 1.6, age) * (1 - sstep(6.5, 9.0, age));
+  out.save();
+  out.textBaseline = 'alphabetic';
+  if (titleA > 0.004) {
+    out.globalAlpha = titleA * 0.5;
+    out.fillStyle = '#9fe8c0';
+    out.textAlign = 'center';
+    out.font = '400 ' + Math.round(9 * SCALE) + 'px ' + FONT;
+    if (hasTrack) out.letterSpacing = 2.4 * SCALE + 'px';
+    out.fillText('ONE BEAM, NO IMAGES · SEED ' + SEED, W * 0.5, H * 0.62);
+    if (hasTrack) out.letterSpacing = '0px';
+  }
+  var hudA = (1 - sstep(hudUntil - 1.4, hudUntil, age)) * 0.55;
+  if (hudA > 0.004) {
+    out.globalAlpha = hudA;
+    out.fillStyle = '#8fd8c8';
+    out.textAlign = 'center';
+    out.font = '400 ' + Math.round(9 * SCALE) + 'px ' + FONT;
+    if (hasTrack) out.letterSpacing = 1.2 * SCALE + 'px';
+    out.fillText((AudioEng.on() ? 'sound on' : 'click for sound') +
+      '   drag rotate   wheel globe/system   click a craft   n new meet   p pause   f full',
+      W * 0.5, H - 10 * SCALE);
+    if (hasTrack) out.letterSpacing = '0px';
+  }
+  if (AudioEng.pending()) {
+    out.globalAlpha = 0.45 + 0.25 * Math.sin(T * 2.4);
+    out.fillStyle = '#8fd8c8';
+    out.textAlign = 'left';
+    out.font = '400 ' + Math.round(10 * SCALE) + 'px ' + FONT;
+    out.fillText('♪', 14 * SCALE, H - 10 * SCALE);
+  }
+  out.restore();
+  out.globalAlpha = 1;
+}
+
+// ──────────────────────────────────────────────────────────────────── 10. audio
+//
+// A broadcast bed, not a soundtrack. A room tone, the carrier of an open comms
+// channel, a clock tick, and a tone as each craft crosses the live gate.
+//
+// The gate tones read the same lap phase the pixels do, so a craft is heard
+// crossing because it crossed. That is the sync the first piece in this folder
+// listed as its most obviously unfinished thing; it is a rule here.
+
+var AudioEng = (function () {
+  var ac = null, master, comp, revIn, started = false, wantOn = false;
+  var noiseBuf = null, timer = 0, nextT = 0, step = 0, dest = null;
+  var lastProg = null, lastLead = -1;
+  var ROOT = 98;
+
+  function mkNoise(sec) {
+    var n = ac.sampleRate * sec, b = ac.createBuffer(1, n, ac.sampleRate), d = b.getChannelData(0);
+    var r = mulberry32(SEED ^ 0xA53F), last = 0;
+    for (var i = 0; i < n; i++) { var x = r() * 2 - 1; last = last * 0.7 + x * 0.3; d[i] = last * 1.6; }
+    return b;
+  }
+  function mkImpulse(sec, decay) {
+    var n = (ac.sampleRate * sec) | 0, b = ac.createBuffer(2, n, ac.sampleRate);
+    var r = mulberry32(SEED ^ 0x1D77);
+    for (var c = 0; c < 2; c++) {
+      var d = b.getChannelData(c);
+      for (var i = 0; i < n; i++) d[i] = (r() * 2 - 1) * Math.pow(1 - i / n, decay);
+    }
+    return b;
+  }
+  function lfo(rate, depth, target, base) {
+    var o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.value = rate; g.gain.value = depth;
+    o.connect(g); g.connect(target);
+    if (base !== undefined) target.value = base;
+    o.start();
+    return o;
+  }
+
+  function build() {
+    master = ac.createGain(); master.gain.value = 0;
+    comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -19; comp.ratio.value = 4; comp.knee.value = 12;
+    master.connect(comp); comp.connect(ac.destination);
+    dest = ac.createMediaStreamDestination(); comp.connect(dest);
+
+    var rev = ac.createConvolver(); rev.buffer = mkImpulse(2.8, 2.8);
+    revIn = ac.createGain(); revIn.gain.value = 0.26;
+    revIn.connect(rev); rev.connect(master);
+
+    noiseBuf = mkNoise(4);
+
+    // room tone: the building the broadcast comes from
+    var dg = ac.createGain(); dg.gain.value = 0.05;
+    var df = ac.createBiquadFilter(); df.type = 'lowpass'; df.Q.value = 2.6;
+    lfo(0.027, 180, df.frequency, 300);
+    df.connect(dg); dg.connect(master); dg.connect(revIn);
+    [[ROOT / 2, 'sine', 0], [ROOT, 'sawtooth', -6], [ROOT, 'sawtooth', 7]].forEach(function (s) {
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.type = s[1]; o.frequency.value = s[0]; o.detune.value = s[2];
+      g.gain.value = s[1] === 'sine' ? 0.8 : 0.2;
+      o.connect(g); g.connect(df); o.start();
+    });
+
+    // the open channel: a carrier hiss that never quite goes away
+    var cn = ac.createBufferSource(); cn.buffer = noiseBuf; cn.loop = true;
+    var cf = ac.createBiquadFilter(); cf.type = 'bandpass'; cf.frequency.value = 1750; cf.Q.value = 0.9;
+    var cg = ac.createGain(); cg.gain.value = 0.020;
+    lfo(0.07, 0.012, cg.gain);
+    cn.connect(cf); cf.connect(cg); cg.connect(master); cg.connect(revIn);
+    cn.start();
+  }
+
+  function blip(when, freq, vel, dur, type) {
+    var o = ac.createOscillator(), g = ac.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, when);
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(0.085 * vel, when + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+    o.connect(g); g.connect(master); g.connect(revIn);
+    o.start(when); o.stop(when + dur + 0.05);
+  }
+
+  // a burst of filtered noise: someone keying a mic
+  function chatter(when, len) {
+    var n = ac.createBufferSource(); n.buffer = noiseBuf; n.loop = true;
+    var f = ac.createBiquadFilter(); f.type = 'bandpass';
+    f.frequency.setValueAtTime(700 + Math.random() * 500, when);
+    f.Q.value = 2.2;
+    var g = ac.createGain();
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.exponentialRampToValueAtTime(0.030, when + 0.02);
+    g.gain.setValueAtTime(0.030, when + len * 0.7);
+    g.gain.exponentialRampToValueAtTime(0.0001, when + len);
+    n.connect(f); f.connect(g); g.connect(master); g.connect(revIn);
+    n.start(when); n.stop(when + len + 0.05);
+  }
+
+  function gateTone(when, teamN) {
+    var f = ROOT * 4 * Math.pow(2, [0, 3, 5, 7, 10, 12][teamN % 6] / 12);
+    blip(when, f, 0.9, 0.10, 'triangle');
+    blip(when + 0.09, f * 1.5, 0.6, 0.16, 'triangle');
+  }
+
+  var STEP = 0.125, rnd2 = mulberry32(SEED ^ 0x77A1);
+  function schedule() {
+    if (!started) return;
+    var look = ac.currentTime + 0.22;
+    while (nextT < look) {
+      var at = simT + (nextT - ac.currentTime);
+
+      // the race clock
+      if (step % 8 === 0) blip(nextT, 1480, 0.16, 0.022, 'sine');
+
+      // ── gate crossings, read off the same phase the picture uses.
+      var prog = [];
+      for (var i = 0; i < world.craft.length; i++) {
+        prog.push((world.craft[i].orb.n * at + world.craft[i].M0 * TAU) / TAU);
+      }
+      if (lastProg) {
+        for (i = 0; i < prog.length; i++) {
+          for (var q = 0; q < world.gates.length; q++) {
+            var gp = world.gates[q].ph;
+            var a0 = lastProg[i] - Math.floor(lastProg[i]);
+            var a1 = prog[i] - Math.floor(prog[i]);
+            var crossed = a1 < a0 ? (gp > a0 || gp <= a1) : (gp > a0 && gp <= a1);
+            if (crossed) gateTone(nextT, i);
+          }
+        }
+      }
+      lastProg = prog;
+
+      // a lead change is the only thing worth a sting
+      var ordNow = lap.order && lap.order.length ? lap.order[0].i : -1;
+      if (ordNow >= 0 && lastLead >= 0 && ordNow !== lastLead) {
+        blip(nextT, ROOT * 4, 1, 0.18, 'sawtooth');
+        blip(nextT + 0.14, ROOT * 6, 0.8, 0.26, 'sawtooth');
+      }
+      if (ordNow >= 0) lastLead = ordNow;
+
+      // comms, sparse
+      if (rnd2() < 0.035) chatter(nextT, 0.25 + rnd2() * 0.7);
+
+      nextT += STEP; step++;
+    }
+  }
+
+  return {
+    on: function () { return started && wantOn; },
+    pending: function () { return !started; },
+    stream: function () { return dest ? dest.stream : null; },
+    lock: function () { if (started && wantOn) { blip(ac.currentTime + 0.01, 880, 0.8, 0.07); blip(ac.currentTime + 0.08, 1320, 0.7, 0.12); } },
+    toggle: function () {
+      if (!started) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        ac = new AC();
+        build();
+        started = true; wantOn = true;
+        nextT = ac.currentTime + 0.1; step = 0;
+        timer = setInterval(schedule, 25);
+        master.gain.setTargetAtTime(0.85, ac.currentTime, 1.2);
+        if (ac.state === 'suspended') ac.resume();
+        return;
+      }
+      wantOn = !wantOn;
+      master.gain.setTargetAtTime(wantOn ? 0.85 : 0, ac.currentTime, 0.4);
+    }
+  };
+})();
+
+var Rec = (function () {
+  var rec = null, chunks = [];
+  function save(blob, ext) {
+    try {
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'apogee-' + SEED + '-' + Date.now() + ext;
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    } catch (e) { /* a sandbox that cannot hand you a file */ }
+  }
+  return {
+    active: function () { return !!rec && rec.state === 'recording'; },
+    still: function () {
+      if (!view.toBlob) return;
+      view.toBlob(function (b) { if (b) save(b, '.p' + 'ng'); }, 'image/' + 'png');
+    },
+    toggle: function () {
+      if (typeof MediaRecorder === 'undefined' || !view.captureStream) return;
+      if (rec && rec.state === 'recording') { rec.stop(); return; }
+      try {
+        var stream = view.captureStream(60);
+        var au = AudioEng.stream();
+        if (au) au.getAudioTracks().forEach(function (t) { stream.addTrack(t); });
+        chunks = [];
+        rec = new MediaRecorder(stream, { mimeType: 'video/webm' });
+        rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+        rec.onstop = function () { save(new Blob(chunks, { type: 'video/webm' }), '.webm'); rec = null; };
+        rec.start();
+      } catch (e) { rec = null; }
+    }
+  };
+})();
+
+// ──────────────────────────────────────────────────────── 11. the purity check
+
+function purity() {
+  var src = document.documentElement.outerHTML;
+  var needles = [
+    'da' + 'ta:', 'ba' + 'se64', '<i' + 'mg', '<vi' + 'deo', '<au' + 'dio', '<sv' + 'g',
+    '<li' + 'nk', '<ifr' + 'ame', 'ht' + 'tp://', 'ht' + 'tps://', '@font-' + 'face',
+    '.p' + 'ng', '.j' + 'pg', '.gi' + 'f', '.we' + 'bp', '.m' + 'p3', '.w' + 'av', '.o' + 'gg'
+  ];
+  var hits = [];
+  for (var i = 0; i < needles.length; i++) {
+    var n = needles[i], at = src.toLowerCase().indexOf(n);
+    if (at >= 0) hits.push(n + ' @' + at);
+  }
+  var report = {
+    bytes: src.length,
+    clean: hits.length === 0,
+    found: hits,
+    canvases: document.querySelectorAll('canvas').length,
+    elements: document.body.children.length
+  };
+  if (report.clean) {
+    console.log('%c apogee ', 'background:#0b3a2e;color:#9fe8c0',
+      'no embedded media — one canvas, ' + report.bytes + ' bytes of markup and script, ' +
+      'every vector computed.');
+  } else {
+    console.warn('apogee: purity check found', hits);
+  }
+  return report;
+}
+
+// ───────────────────────────────────────────────────── 12. the loop, and the hands
+
+var simT = START_FRAME / FPS;
+var lastNow = 0, paused = false, msAvg = 16, raf = 0;
+var drag = null;
+
+function tick(now) {
+  raf = requestAnimationFrame(tick);
+  var dt = lastNow ? Math.min(0.1, (now - lastNow) / 1000) : 1 / FPS;
+  lastNow = now;
+  sess += dt;
+  if (!paused) simT += DETERM ? 1 / FPS : dt;
+
+  cam.az += (cam.tAz - cam.az) * Math.min(1, dt * 7);
+  cam.el += (cam.tEl - cam.el) * Math.min(1, dt * 7);
+  cam.zoom += (cam.tZoom - cam.zoom) * Math.min(1, dt * 5);
+
+  var t0 = performance.now();
+  render(simT);
+  msAvg = msAvg * 0.93 + (performance.now() - t0) * 0.07;
+  if (msAvg > 27 && quality > 0.5) { quality -= 0.25; msAvg = 16; }
+  else if (msAvg < 11 && quality < 1) { quality += 0.25; msAvg = 16; }
+}
+
+function newSeed(s) {
+  SEED = (s === undefined) ? (Math.random() * 1e9) | 0 : s;
+  buildMeet();
+  lockIdx = -1; hoverIdx = -1;
+  sess = 0;
+  try { history.replaceState(null, '', '?s=' + SEED); } catch (e) {}
+}
+
+function toCanvas(e) {
+  var r = view.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+}
+
+function nearestCraft(x, y) {
+  var best = -1, bd = GU * 3.2;
+  for (var i = 0; i < world.craft.length; i++) {
+    var c = world.craft[i];
+    if (c._x === undefined) continue;
+    var dx = c._x - x, dy = c._y - y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+view.addEventListener('pointerdown', function (e) {
+  view.setPointerCapture && view.setPointerCapture(e.pointerId);
+  var p = toCanvas(e);
+  drag = { x: p.x, y: p.y, az: cam.tAz, el: cam.tEl, moved: 0 };
+  ptr = p; pointerIn = true;
+  hudUntil = sess + 9;
+});
+
+window.addEventListener('pointermove', function (e) {
+  var p = toCanvas(e);
+  ptr = p; pointerIn = true;
+  if (drag) {
+    var dx = p.x - drag.x, dy = p.y - drag.y;
+    drag.moved += Math.abs(dx) + Math.abs(dy);
+    cam.tAz = drag.az + dx / Math.min(W, H) * 3.4;
+    cam.tEl = clamp(drag.el + dy / Math.min(W, H) * 2.8, -1.45, 1.45);
+  } else {
+    hoverIdx = nearestCraft(p.x, p.y);
+  }
+  hudUntil = Math.max(hudUntil, sess + 4);
+});
+
+window.addEventListener('pointerup', function (e) {
+  if (drag && drag.moved < 6 * SCALE) {
+    var p = toCanvas(e);
+    var hit = nearestCraft(p.x, p.y);
+    if (hit >= 0 && hit !== lockIdx) { lockIdx = hit; AudioEng.lock(); }
+    else if (hit < 0) lockIdx = -1;
+    if (!AudioEng.on()) AudioEng.toggle();
+  }
+  drag = null;
+});
+
+window.addEventListener('pointerleave', function () { pointerIn = false; hoverIdx = -1; });
+
+view.addEventListener('wheel', function (e) {
+  e.preventDefault();
+  cam.tZoom = clamp(cam.tZoom + e.deltaY * 0.0011, 0, 1);
+  hudUntil = sess + 6;
+}, { passive: false });
+
+window.addEventListener('keydown', function (e) {
+  var key = e.key.toLowerCase();
+  if (key === ' ') { AudioEng.toggle(); e.preventDefault(); }
+  else if (key === 'p') paused = !paused;
+  else if (key === 'n') newSeed();
+  else if (key === '[') simT -= 3;
+  else if (key === ']') simT += 3;
+  else if (key === 'escape') lockIdx = -1;
+  else if (key === 'r') Rec.toggle();
+  else if (key === 'c') Rec.still();
+  else if (key === '0') { cam.tAz = CAM0.az; cam.tEl = CAM0.el; cam.tZoom = CAM0.zoom; }
+  else if (key >= '1' && key <= '6') { lockIdx = Math.min(world.craft.length - 1, parseInt(key, 10) - 1); AudioEng.lock(); }
+  else if (key === 'f') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen();
+  }
+  else return;
+  hudUntil = sess + 7;
+});
+
+// The door every tool in art/ drives a piece through. frame() resets the camera
+// and clears any lock, because a deterministic frame has to be deterministic no
+// matter what somebody dragged a moment ago.
+window.apogee = {
+  frame: function (n) {
+    cam.az = cam.tAz = CAM0.az;
+    cam.el = cam.tEl = CAM0.el;
+    cam.zoom = cam.tZoom = CAM0.zoom;
+    lockIdx = -1; hoverIdx = -1; pointerIn = false;
+    simT = n / FPS;
+    render(simT);
+    return n;
+  },
+  seed: function (s) { newSeed(s | 0); render(simT); return SEED; },
+  // Pin the canonical camera, so seed + frame + view is still exactly
+  // reproducible — it just is not always the same three numbers.
+  view: function (az, el, zoom) {
+    if (az !== undefined && az !== null) CAM0.az = az;
+    if (el !== undefined && el !== null) CAM0.el = clamp(el, -1.45, 1.45);
+    if (zoom !== undefined && zoom !== null) CAM0.zoom = clamp(zoom, 0, 1);
+    cam.az = cam.tAz = CAM0.az; cam.el = cam.tEl = CAM0.el; cam.zoom = cam.tZoom = CAM0.zoom;
+    render(simT);
+    return { az: CAM0.az, el: CAM0.el, zoom: CAM0.zoom };
+  },
+  purity: purity,
+  info: function () {
+    return { seed: SEED, w: W, h: H, loop: LOOP, quality: quality, t: simT,
+             az: cam.az, el: cam.el, zoom: cam.zoom, gate: lap.gate,
+             leader: lap.order && lap.order.length ? world.craft[lap.order[0].i].team : null,
+             lock: lockIdx, compact: compact };
+  }
+};
+window.artPiece = window.apogee;
+
+resize();
+if (STILL) { render(simT); }
+else { raf = requestAnimationFrame(tick); }
+window.apogeeReady = true;
+window.artReady = true;
+
+})();
+</script>
+</body></html>
