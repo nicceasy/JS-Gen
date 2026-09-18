@@ -1,3 +1,6 @@
 art/.renders/
 art/node_modules/
 node_modules/
+art/.renders/look/
+.env
+.env.local

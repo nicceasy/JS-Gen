@@ -9,10 +9,13 @@
     "sheet": "node tools/sheet.mjs",
     "smoke": "node tools/smoke.mjs",
     "audio": "node tools/audio.mjs",
-    "ablate": "node tools/ablate.mjs"
+    "ablate": "node tools/ablate.mjs",
+    "look": "node tools/look.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.49.0"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }

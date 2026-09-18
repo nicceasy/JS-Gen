@@ -172,6 +172,12 @@ so "same seed and frame gives the same pixels" is checked rather than asserted.
 | `tools/smoke.mjs` | loop, audio, keys, pointer, resize, offline |
 | `tools/audio.mjs` | proves the synth built and is scheduling |
 | `tools/ablate.mjs` | where the frame time really goes |
+| `tools/look.mjs` | the vision loop — render frames, get a schema-constrained critique keyed to real function names |
+
+`tools/look.mjs` is the only tool that needs the network, and it is
+provider-agnostic: set `LOOK_BASE_URL`, `LOOK_MODEL` and `LOOK_API_KEY` for any
+OpenAI-compatible router. Run it with `--dry` to build the request and exercise
+its validator without calling out. **Never commit the key.**
 
 Every tool takes `--piece`, and defaults to `lamplighter.html`. `verify.mjs`
 covers every piece in the folder in one run.
