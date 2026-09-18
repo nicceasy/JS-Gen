@@ -8,6 +8,17 @@
 // generation and a cheap model makes it worse, but LOOKING at twelve frames is
 // embarrassingly parallel and mostly mechanical.
 //
+// Two stages, because they are two different jobs:
+//
+//   stage 1  a vision model, once per frame batch, expensive
+//            "what do you SEE that is wrong?"  -> free-form symptoms
+//
+//   stage 2  Jev (tools/decide.mjs), once per finding, ~free
+//            "so what do we DO about it?"      -> typed choice + probability
+//
+// The volume is all in stage 2, which is where sub-500 ms and free output
+// tokens compound. Jev cannot do stage 1 at all — it does not take images.
+//
 //   node tools/look.mjs --piece apogee.html --dry          # no network, prints the request
 //   node tools/look.mjs --piece apogee.html                # live
 //   node tools/look.mjs --piece parallax.html --frames 0,720,1440,2160,2880 --views wide,edge
@@ -47,6 +58,7 @@
 import fs from 'fs';
 import path from 'path';
 import { launch, openPiece, args, nums, ART, die } from './lib.mjs';
+import { ask, blameQuestion, triageQuestion, configured as jevReady, model as jevModel } from './decide.mjs';
 
 const a = args();
 const piece = a.piece || 'lamplighter.html';
@@ -227,6 +239,10 @@ if (DRY || !KEY || !MODEL) {
     const codes = (b.issues || [b]).map(i => i.code + ': ' + i.message).join('; ');
     console.log('      - ' + codes);
   }
+  console.log('\n  stage two (triage) would then ask Jev, per accepted finding:');
+  console.log('    fn     -> one of ' + cat.targets.length + ' catalog entries (unrepresentable if wrong)');
+  console.log('    action -> ' + Object.keys(triageQuestion().criteria).join(' | '));
+  console.log('    ' + (jevReady() ? 'JEV_API_KEY is set' : 'JEV_API_KEY not set - would report fallbacks'));
   console.log('');
   process.exit(probe.ok.length === 1 && probe.bad.length === 3 ? 0 : 1);
 }
@@ -284,7 +300,41 @@ if (bad.length) {
   }
 }
 
+// ─────────────────────────────────────────────────────── triage (System One)
+//
+// The vision model said what it sees. Deciding what to DO about each finding is
+// a separate, typed, high-volume question, and that is Jev's shape: a choice
+// over a criteria map, in 70-500 ms, with output tokens free. Crucially it also
+// re-blames the function from a catalog, where an out-of-catalog answer is not
+// something to validate but something that cannot be represented.
+//
+// Without a key this reports the fallback plainly rather than inventing one.
+const triaged = [];
+for (const f of ok) {
+  const res = await ask(
+    { piece, symptom: f.symptom, frame: f.frame,
+      seen_on: views.length > 1 ? 'full-size render' : 'full-size render',
+      model_said_fn: f.fn },
+    { fn: blameQuestion(cat.targets), action: triageQuestion() },
+    { fallbacks: { fn: f.fn, action: 'render_full_size' }, timeoutMs: 6000 }
+  );
+  triaged.push({ ...f, fn: res.answers.fn.choice, action: res.answers.action.choice,
+                 p: res.answers.action.probability ?? null, source: res.source });
+}
+
+const ACTIONS = ['act_now', 'render_full_size', 'dump_parameters', 'defer', 'reject'];
+console.log('\n  triage: ' + (jevReady() ? jevModel() : 'no JEV_API_KEY - showing fallbacks, not decisions'));
+for (const act of ACTIONS) {
+  const rows = triaged.filter(t => t.action === act);
+  if (!rows.length) continue;
+  console.log('\n  ' + act + '  (' + rows.length + ')');
+  for (const t of rows) {
+    console.log('    ' + t.fn + '  f' + t.frame + '  ' + t.symptom +
+                (t.p != null ? '   p=' + Number(t.p).toFixed(2) : ''));
+  }
+}
+
 const outFile = path.join(OUT, 'findings.json');
-fs.writeFileSync(outFile, JSON.stringify({ piece, seed, model: MODEL, accepted: ok, rejected: bad }, null, 2));
+fs.writeFileSync(outFile, JSON.stringify({ piece, seed, model: MODEL, triaged, rejected: bad }, null, 2));
 console.log('\n  ' + path.relative(process.cwd(), outFile));
-console.log('  findings are keyed to function names — feed them to tools/patch.mjs\n');
+console.log('  act_now findings are keyed to function names — feed them to tools/patch.mjs\n');

@@ -172,12 +172,17 @@ so "same seed and frame gives the same pixels" is checked rather than asserted.
 | `tools/smoke.mjs` | loop, audio, keys, pointer, resize, offline |
 | `tools/audio.mjs` | proves the synth built and is scheduling |
 | `tools/ablate.mjs` | where the frame time really goes |
-| `tools/look.mjs` | the vision loop — render frames, get a schema-constrained critique keyed to real function names |
+| `tools/look.mjs` | the vision loop — render frames, get a critique keyed to real function names, then triage it |
+| `tools/decide.mjs` | a System One client (TypeSafe Jev): typed decisions over a criteria map, for the judgment calls this process makes over and over |
 
-`tools/look.mjs` is the only tool that needs the network, and it is
-provider-agnostic: set `LOOK_BASE_URL`, `LOOK_MODEL` and `LOOK_API_KEY` for any
-OpenAI-compatible router. Run it with `--dry` to build the request and exercise
-its validator without calling out. **Never commit the key.**
+`look.mjs` and `decide.mjs` are the only tools that need the network, and they
+split the work: a vision model says what it sees (`LOOK_BASE_URL`, `LOOK_MODEL`,
+`LOOK_API_KEY` — anything OpenAI-compatible), then Jev decides what to do about
+each finding (`JEV_BASE_URL`, `JEV_MODEL`, `JEV_API_KEY`). Jev answers a choice
+over a criteria map, so an answer outside the catalog is not something to
+validate — it cannot be represented. Every call has a fallback, so a blocked
+network degrades the pipeline instead of stopping it. Run `look` with `--dry` to
+exercise both guardrails offline. **Never commit either key.**
 
 Every tool takes `--piece`, and defaults to `lamplighter.html`. `verify.mjs`
 covers every piece in the folder in one run.

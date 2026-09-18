@@ -10,7 +10,8 @@
     "smoke": "node tools/smoke.mjs",
     "audio": "node tools/audio.mjs",
     "ablate": "node tools/ablate.mjs",
-    "look": "node tools/look.mjs"
+    "look": "node tools/look.mjs",
+    "decide": "node tools/decide.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.49.0"
